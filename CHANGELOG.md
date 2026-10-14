@@ -7,12 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-10-15
+
+deja now reads Windsurf / Devin Desktop: Cascade's encrypted conversation
+files are decrypted, authenticated and indexed, and `deja install windsurf`
+adds the MCP server, a global rule, the skill and a `/deja` workflow. That
+makes 42 harnesses. Grok Build installs the plugin from this repository's own
+marketplace, and a Spec Kit extension ships with each release. The person sees
+more of what deja did: the first session names an error the machine keeps
+hitting, the weekly note names the session agents used, and dsh, Hermes,
+OpenClaw and Gemini show deja's line where the person reads it. Kimi Code and
+Qwen Code edit calls are pinned by fixtures from @beiryu.
+
 ### Changed
 
 - deja's lines for the person fit on one line each, and a session start shows the recall receipt plus at most one once-only note (the built note, what changed, the week note, the GitHub line), so a fresh install no longer opens with four lines. The receipt drops its byte count and the docs line folds into the built note. What the model receives is unchanged.
 
 ### Added
 
+- A [Spec Kit](https://github.com/github/spec-kit) extension: `/speckit.deja-vu.recall` searches past agent sessions for the current feature's spec and plan and reports what was tried, decided or failed, citing session ids. It registers an optional `before_implement` hook, so `/speckit.implement` offers it and runs nothing unless you agree. Each release attaches it as `deja-spec-kit.zip`: `specify extension add deja-vu --from https://github.com/vshulcz/deja-vu/releases/latest/download/deja-spec-kit.zip`.
 - The weekly note names the session agents used, with an id `deja show` opens: `agents used "fix the JWT clock skew…" (claude) — deja show e8b6eefc-fec`. Used means an agent credited it this week with a `déjà vu: … (deja:<id>)` line; without one, the session recalled twice or more stands in. `hook-context --notes` can land in a group chat, so there it says `agents used a claude session — deja show <id>` and quotes no title. A week with nothing used reads as before, and what the model receives is unchanged (#4615).
 - Windsurf / Devin Desktop Cascade conversations are read from `~/.codeium/windsurf/cascade/*.pb` (`DEJA_WINDSURF_ROOT` moves it): typed prompts and the planner's replies, decrypted and authenticated first. A trajectory that fails authentication is skipped and counted, and `deja doctor` says how many. `deja install windsurf` writes the MCP server into `~/.codeium/windsurf/mcp_config.json`, deja's guidance block into `memories/global_rules.md` (left out, with a note, when the file would pass Cascade's 6,000-character cap), the deja-history skill into `skills/`, and a `/deja` workflow into `global_workflows/`. Cascade hooks are not wired: none of their output reaches the model. No resume: `devin-desktop --sessions` opens the Sessions window, and nothing takes a conversation id. Researched by @yearth (#308).
 - The first session after a build says one thing from the person's own history under the counts: the error this machine keeps hitting and which agents hit it, ``this machine has hit `command not found: timeout` in 32 sessions (claude, codex)``, or with no such error a question asked again days apart. `hook-context --notes` feeds plugin replies that can land in a group chat, so it names the error and never quotes a question. A history with neither keeps the one-line note, and what the model receives is unchanged (#4616).
@@ -23,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Grok Build install line works: deja was never in `xai-org/plugin-marketplace`, so `grok plugin install deja` after adding it found nothing. This repository is a Grok marketplace now, `grok plugin marketplace add vshulcz/deja-vu` then `grok plugin install deja`; the official entry is still in review (xai-org/plugin-marketplace#332).
 - ZCode keeps the per-prompt recall when the "you have been here" line is due. `hook-prompt` ignored the `--strict` that ZCode's hook passes, so the reply carried `systemMessage` and ZCode discarded all of it, recall included.
 - Cursor no longer uses up deja's notes for the person. It shows a hook's message only when the hook blocks, so the once-only notes (the built note, the week note) and the session-start receipt went to Cursor, were counted as shown and never seen, and Claude Code on the same index skipped them. A Cursor session start now gets only the model's text, which is unchanged, and leaves those notes for the next host that shows them; a session start under `--strict` or `--copilot` does the same. A rewire after an upgrade still happens on a Cursor start, and its note is dropped there.
 - In the Gemini CLI TUI, deja's lines end in `[deja]` instead of the full hook command (`[/Users/…/deja-hook hook-prompt]`), which wrapped the receipt onto a second line. The extension is rewritten on upgrade, so nothing to re-run.

@@ -13,8 +13,9 @@ same local index.
 | [`pi/`](pi) | npm `@vshulcz/pi-deja` (`pi-package`, also read by omp) | `pi install npm:@vshulcz/pi-deja` |
 | [`zed/`](zed) | Zed extension `deja-mcp-server` (in review: zed-industries/extensions#7307) | Zed → Extensions → deja |
 | [`kimi/`](kimi) | Kimi Code plugin `deja` | `/plugins install https://github.com/vshulcz/deja-vu` |
-| [`grok/`](grok) | Grok Build plugin `deja` (in review: xai-org/plugin-marketplace#332) | `grok plugin install deja` |
+| [`grok/`](grok) | Grok Build plugin `deja` from this repository's marketplace, then `grok plugin install deja` (official entry in review: xai-org/plugin-marketplace#332) | `grok plugin marketplace add vshulcz/deja-vu` |
 | [`hermes/`](hermes) | Hermes memory provider `deja-memory` | `hermes plugins install vshulcz/deja-vu/extensions/hermes` |
+| [`spec-kit/`](spec-kit) | Spec Kit extension `deja-vu`, release asset `deja-spec-kit.zip` | `specify extension add deja-vu --from https://github.com/vshulcz/deja-vu/releases/latest/download/deja-spec-kit.zip` |
 
 Four more integrations live outside this directory because their registries or
 install commands read a fixed path in this repository: `claude-plugin/` (Claude
@@ -48,11 +49,12 @@ cd extensions/openclaw && npm publish --access public && clawhub package publish
 cd extensions/pi       && npm publish --access public
 ```
 
-The Grok plugin is published by a catalog entry, not by us: the entry in
-`xai-org/plugin-marketplace` pins a full commit SHA of this repository and a
-`path` of `extensions/grok`, and Grok re-verifies the SHA after cloning. A new
-version of the plugin means a pull request there that moves the pin — nothing
-ships until it does.
+The Grok plugin installs from this repository's own catalog,
+`.grok-plugin/marketplace.json`, which points at `extensions/grok` on `main`, so
+it ships with every merge. The entry proposed to `xai-org/plugin-marketplace`
+pins a full commit SHA of this repository and a `path` of `extensions/grok`, and
+Grok re-verifies the SHA after cloning; once it lands, a new version there means
+a pull request that moves the pin.
 
 The Zed extension is not published by us: `zed-industries/extensions` pins this
 repository as a submodule and builds `extensions/zed`. A new version means
@@ -69,6 +71,14 @@ marketplace entry. `TestKimiManifestsAgree` keeps the two manifests one plugin.
 Kimi notifies about updates only for plugins installed from its own
 marketplace, so `deja doctor` reports the installed plugin version against the
 one this deja ships.
+
+The Spec Kit extension is not a harness: it is a `/speckit.deja-vu.recall`
+command that any agent Spec Kit drives can run before `/speckit.implement`. Each
+release packs `extensions/spec-kit` into `deja-spec-kit.zip` after
+`scripts/pinmanifests` has set its version to the release's, and attaches it.
+The entry in github/spec-kit's community catalog pins one release's zip URL and
+its sha256 (the release job prints it in the run summary), so a new version
+there means a new submission through their Extension Submission issue form.
 
 Gemini installs this repository itself: `gemini extensions install
 https://github.com/vshulcz/deja-vu` reads `gemini-extension.json` at the
