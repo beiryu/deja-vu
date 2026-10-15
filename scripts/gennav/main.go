@@ -83,6 +83,7 @@ var groups = []group{
 		{"delete-amp-thread-history.html", "Amp"},
 		{"delete-continue-session-history.html", "Continue"},
 		{"delete-kiro-session-history.html", "Kiro"},
+		{"delete-kimi-code-session-history.html", "Kimi Code"},
 	}},
 	{title: "Per-agent guides", fold: true, links: []link{
 		{"memory-for-aider.html", "aider"},
