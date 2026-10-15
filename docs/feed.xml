@@ -102,6 +102,13 @@
     <summary>opencode keeps every session in one SQLite database. What the tables hold, how to remove a session, and why deleting rows does not free the space.</summary>
   </entry>
   <entry>
+    <title>Delete Windsurf Cascade history — deja-vu</title>
+    <id>https://vshulcz.github.io/deja-vu/guide/delete-windsurf-cascade-history.html</id>
+    <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/delete-windsurf-cascade-history.html"></link>
+    <updated>2026-10-14T00:00:00Z</updated>
+    <summary>Windsurf and Devin Desktop keep one encrypted file per Cascade conversation. Where it is, how to delete one or all, and what to leave alone beside it.</summary>
+  </entry>
+  <entry>
     <title>Does Claude Code remember previous conversations? — deja-vu</title>
     <id>https://vshulcz.github.io/deja-vu/guide/does-my-agent-remember.html</id>
     <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/does-my-agent-remember.html"></link>
