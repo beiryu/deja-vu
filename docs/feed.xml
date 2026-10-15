@@ -18,6 +18,20 @@
     <summary>Kimi Code keeps each session in its own directory. Find it, remove one session or all, and delete the state.json that would still list it.</summary>
   </entry>
   <entry>
+    <title>Delete Windsurf Cascade history — deja-vu</title>
+    <id>https://vshulcz.github.io/deja-vu/guide/delete-windsurf-cascade-history.html</id>
+    <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/delete-windsurf-cascade-history.html"></link>
+    <updated>2026-10-15T00:00:00Z</updated>
+    <summary>Windsurf and Devin Desktop keep one encrypted file per Cascade conversation. Where it is, how to delete one or all, and what to leave alone beside it.</summary>
+  </entry>
+  <entry>
+    <title>Memory for Windsurf / Devin Desktop Cascade — deja-vu</title>
+    <id>https://vshulcz.github.io/deja-vu/guide/memory-for-windsurf.html</id>
+    <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/memory-for-windsurf.html"></link>
+    <updated>2026-10-15T00:00:00Z</updated>
+    <summary>Cascade writes each conversation to an encrypted file under ~/.codeium/windsurf and starts new ones without them. deja reads the files and gives Cascade recall.</summary>
+  </entry>
+  <entry>
     <title>deja-vu — the one memory your coding agents share</title>
     <id>https://vshulcz.github.io/deja-vu/</id>
     <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/"></link>
@@ -100,13 +114,6 @@
     <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/delete-opencode-session-history.html"></link>
     <updated>2026-10-14T00:00:00Z</updated>
     <summary>opencode keeps every session in one SQLite database. What the tables hold, how to remove a session, and why deleting rows does not free the space.</summary>
-  </entry>
-  <entry>
-    <title>Delete Windsurf Cascade history — deja-vu</title>
-    <id>https://vshulcz.github.io/deja-vu/guide/delete-windsurf-cascade-history.html</id>
-    <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/delete-windsurf-cascade-history.html"></link>
-    <updated>2026-10-14T00:00:00Z</updated>
-    <summary>Windsurf and Devin Desktop keep one encrypted file per Cascade conversation. Where it is, how to delete one or all, and what to leave alone beside it.</summary>
   </entry>
   <entry>
     <title>Does Claude Code remember previous conversations? — deja-vu</title>
@@ -282,12 +289,5 @@
     <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/memory-for-grok.html"></link>
     <updated>2026-10-14T00:00:00Z</updated>
     <summary>How to give Grok Build recall over every coding agent&#39;s sessions on the machine — the hooks it reads, the marketplace plugin, and the name that is not it.</summary>
-  </entry>
-  <entry>
-    <title>Add memory to Hermes: every agent&#39;s sessions — deja-vu</title>
-    <id>https://vshulcz.github.io/deja-vu/guide/memory-for-hermes.html</id>
-    <link rel="alternate" type="text/html" href="https://vshulcz.github.io/deja-vu/guide/memory-for-hermes.html"></link>
-    <updated>2026-10-14T00:00:00Z</updated>
-    <summary>Hermes searches its own sessions and keeps MEMORY.md. deja adds the other forty-one agents: a plugin on pre_llm_call, the MCP tools, and a skill.</summary>
   </entry>
 </feed>
