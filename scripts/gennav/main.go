@@ -83,6 +83,8 @@ var groups = []group{
 		{"delete-amp-thread-history.html", "Amp"},
 		{"delete-continue-session-history.html", "Continue"},
 		{"delete-kiro-session-history.html", "Kiro"},
+		{"delete-kimi-code-session-history.html", "Kimi Code"},
+		{"delete-windsurf-cascade-history.html", "Windsurf"},
 	}},
 	{title: "Per-agent guides", fold: true, links: []link{
 		{"memory-for-aider.html", "aider"},
@@ -118,6 +120,7 @@ var groups = []group{
 		{"memory-for-roo.html", "Roo Code"},
 		{"memory-for-senpi.html", "Senpi"},
 		{"memory-for-copilot-chat.html", "VS Code Copilot Chat"},
+		{"memory-for-windsurf.html", "Windsurf"},
 		{"memory-for-zcode.html", "ZCode"},
 		{"memory-for-zed.html", "Zed"},
 	}},
