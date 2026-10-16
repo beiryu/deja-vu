@@ -282,6 +282,10 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 		return err
 	}
 	defer unlock()
+	return ensureHeld(dir, harness, force, progress)
+}
+
+func ensureHeld(dir string, harness string, force bool, progress io.Writer) error {
 	sweepStaleTmp(dir)
 	// The manifest is read before the walk so unchanged files can carry
 	// their derived state forward instead of being re-read.
@@ -296,7 +300,7 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 		scope = harness
 	}
 	m, err := prior, priorErr
-	if !force && err == nil && notesZoneDrifted(m) {
+	if !force && err == nil && zoneDrifted(m) {
 		force = true
 	}
 	// A store skipped for a missing CLI has unchanged files, so the
@@ -310,6 +314,36 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 		return nil
 	}
 	return updateIndex(dir, harness, scope, want, force, progress)
+}
+
+// EnsureUnlessBusy is Ensure for a reader that can answer from the index on
+// disk, such as `deja last` and `deja show`. When another deja holds the lock
+// (a `deja index` or a hook refresh for its whole pass, or another reader) it
+// reports busy at once instead of waiting, and the caller reads the snapshot.
+// With the lock free it is Ensure(dir, "", false, progress). It still waits
+// when the snapshot is not one to answer from: no index yet, one below the
+// layout or redaction floor this build serves, or a record log shorter than
+// the manifest says. A lock file that cannot be opened is not a held lock, so
+// a read-only index fails the way Ensure fails it.
+func EnsureUnlessBusy(dir string, progress io.Writer) (bool, error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	unlock, ok, err := tryLockDir(dir)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		defer unlock()
+		return false, ensureHeld(dir, "", false, progress)
+	}
+	if f, err := os.OpenFile(dir+".lock", os.O_RDWR, 0); err == nil {
+		_ = f.Close()
+		if m, err := readManifestCached(dir); err == nil && !mustRebuildBeforeAnswering(m, version) && recordsReadable(dir, m) {
+			return true, nil
+		}
+	}
+	return false, Ensure(dir, "", false, progress)
 }
 
 func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer) error {
@@ -386,7 +420,7 @@ func ensureLocked(dir string, o query.Options, force bool, progress io.Writer) e
 	want := currentFilesReusing("", priorFiles(prior, priorErr))
 	scope := ""
 	m, err := prior, priorErr
-	if !force && err == nil && notesZoneDrifted(m) {
+	if !force && err == nil && zoneDrifted(m) {
 		force = true
 	}
 	if !force && err == nil && manifestFresh(m, want, scope) && recordsIntact(dir, m) {
@@ -473,9 +507,9 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 		// tool (#3552).
 		return true, nil
 	}
-	if notesZoneDrifted(m) {
-		// Regrouping the day buckets is a full rebuild; hand it to the
-		// detached warmup and say the current answer is stale.
+	if zoneDrifted(m) {
+		// Regrouping the day buckets or rereading aider headers in this zone
+		// is a full rebuild; hand it to the detached warmup and say the current answer is stale.
 		return true, nil
 	}
 	if manifestFresh(m, want, "") {
@@ -496,7 +530,7 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 			removedAny = true
 		}
 	}
-	if !removedAny && canAppendIncremental(changed, m.Files) {
+	if !removedAny && canAppendIncremental(changed, m.Files) && !promptLogTakeover(changed, m.Files, m.Sessions) {
 		mark("decide append")
 		// An append is cheap until it isn't. A live session that has been
 		// writing all day — a Grok `updates.jsonl` in the tens of megabytes —
@@ -635,6 +669,7 @@ func rebuildWithTombstones(dir string, harness string, scope string, files map[s
 			len(vanished), pluralS(len(vanished)), map[bool]string{true: "its", false: "their"}[len(vanished) == 1])
 	}
 	ss = filterTombstonedSet(ss, dead)
+	ss = dropShadowedPrompts(ss, nil)
 	for p, st := range orphans.files {
 		if !st.Kept && orphans.dated {
 			st.KeptAt = time.Now().Unix()
@@ -660,7 +695,7 @@ func rebuildWithTombstones(dir string, harness string, scope string, files map[s
 	// incremental build carries the old stamp forward: it keeps records it
 	// wrote under the previous patterns, which is why `deja index` has to ask
 	// for a rebuild rather than quietly declaring the new list in force (#1307).
-	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
+	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imported.watermarks, ExportBoundary: imported.boundary, ImportedRecords: imported.dedupe,
 		Compactions:        compactions,
 		ExcludeFingerprint: sources.ExclusionFingerprint(),
@@ -1210,8 +1245,10 @@ func deriveImportedNoteState(s *model.Session) {
 			continue
 		}
 		s.Lifecycle, s.LifecycleNote = st, note
+		// The UTC day, as import stores it: records come back in this
+		// machine's zone, and the rebuild must not move the date (#5053).
 		if !msg.Time.IsZero() {
-			s.LifecycleAt = msg.Time.Format("2006-01-02")
+			s.LifecycleAt = msg.Time.UTC().Format(lifecycleDay)
 		}
 		return
 	}
@@ -1659,6 +1696,7 @@ func writeSessions(tmp, dir string, ss []model.Session, files map[string]FileSta
 }
 
 func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string]FileState, scope string, imp importedState) error {
+	ss = dropShadowedPrompts(ss, nil)
 	// The counters belong to this build. Draining them only on read made
 	// "since the last build" true only when the last read was the last build:
 	// a second build in one process reported its own empty transcripts plus
@@ -1672,7 +1710,7 @@ func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string
 	writtenMessages := 0
 	lastIngestFiles = len(files)
 	parsedThisPass(files)
-	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
+	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imp.watermarks, ExportBoundary: imp.boundary, ImportedRecords: imp.dedupe,
 		Compactions:        imp.compactions,
 		ExcludeFingerprint: sources.ExclusionFingerprint(),
@@ -2900,8 +2938,9 @@ func attributeSession(held SessionMeta, s model.Session) (owns, collided bool) {
 	// the directory it ran in; the history line holds the prompt and the
 	// project "history". Sort order gave the row to history.jsonl, so a TUI
 	// session was filed outside its project and resume refused it as an exec
-	// entry (#4180).
-	if s.Harness == "codex" {
+	// entry (#4180). TRAE writes the same pair, and Claude Code's prompt log
+	// sorts ahead of its projects folder the same way (#5046).
+	if s.Harness == "codex" || s.Harness == "trae" || s.Harness == "claude" {
 		if newIsHist, heldIsHist := isCodexHistory(s.Path), isCodexHistory(held.Path); newIsHist != heldIsHist {
 			return !newIsHist, false
 		}
@@ -2967,10 +3006,114 @@ func holdsText(s model.Session) bool {
 	return false
 }
 
-// isCodexHistory reports whether a path is Codex's prompt log rather than a
-// rollout. Named, for the reason isGooseStore gives.
+// isCodexHistory reports whether a path is a prompt log rather than a
+// transcript: Codex's, TRAE's or Claude Code's history.jsonl. Named, for the
+// reason isGooseStore gives.
 func isCodexHistory(path string) bool {
-	return strings.EqualFold(filepath.Base(path), "history.jsonl")
+	return sources.IsPromptLog(path)
+}
+
+// promptLogTakeover reports whether a file new to this pass is the transcript
+// of a session the index holds from a prompt log alone. Claude Code writes the
+// prompt to history.jsonl before the transcript line, and deja's own prompt
+// hook runs a pass in between, so a new session's first prompt is indexed from
+// the log and its transcript lands a pass later. The append path can only add
+// to what is stored; the replacement path drops the log's copy, which is what a
+// rebuild, reading the transcript and skipping the line, gives. A Codex rollout
+// after its history line is the same pair. The id is in the file name: the
+// whole stem for Claude, the trailing UUID of a rollout.
+func promptLogTakeover(changed, oldFiles map[string]FileState, sessions map[string]SessionMeta) bool {
+	logged := map[string]bool{}
+	for _, meta := range sessions {
+		if isCodexHistory(meta.Path) {
+			logged[meta.ID] = true
+		}
+	}
+	if len(logged) == 0 {
+		return false
+	}
+	for p := range changed {
+		if _, known := oldFiles[p]; known || isCodexHistory(p) {
+			continue
+		}
+		stem := filepath.Base(fileStem(p))
+		if logged[stem] || (len(stem) > 36 && logged[stem[len(stem)-36:]]) {
+			return true
+		}
+	}
+	return false
+}
+
+// promptLogTakeovers names the sessions of this batch whose row came from a
+// prompt log and that a transcript now holds.
+func promptLogTakeovers(ss []model.Session, held map[string]SessionMeta) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range ss {
+		key := s.Harness + ":" + s.ID
+		if meta, ok := held[key]; ok && isCodexHistory(meta.Path) && !isCodexHistory(s.Path) {
+			out[key] = true
+		}
+	}
+	return out
+}
+
+// freshPromptWait is how long a prompt-log line with no transcript beside it
+// waits before it is taken for a session whose transcript is gone. Claude Code
+// writes the transcript line a moment after the prompt; a pass in between
+// would index the prompt twice and leave the takeover to a full rewrite.
+const freshPromptWait = 5 * time.Minute
+
+// waitsForTranscript reports whether a prompt log's tail holds a session the
+// index does not know whose last prompt is younger than freshPromptWait. The
+// file is then left for the next pass to read from the same offset, by which
+// time the transcript is on disk and the parser skips the line.
+func waitsForTranscript(ss []model.Session, held map[string]SessionMeta, now time.Time) bool {
+	for _, s := range ss {
+		if _, ok := held[s.Harness+":"+s.ID]; ok {
+			continue
+		}
+		if !s.Updated.IsZero() && now.Sub(s.Updated) < freshPromptWait {
+			return true
+		}
+	}
+	return false
+}
+
+// dropShadowedPrompts drops a session read from a prompt log when a transcript
+// holds the same id, in this batch or in the rows the index already has. A
+// prompt log is read for sessions whose transcript is not on disk, and one deja
+// kept after the client deleted it is exactly that: its prompts merged into
+// the kept conversation a second time, at the log's own instant, and on the
+// append path the log took the row because the kept path was gone (#5046). A
+// rebuild sees the kept transcript in its batch, an incremental pass in held,
+// so both drop the same lines.
+func dropShadowedPrompts(ss []model.Session, held map[string]SessionMeta) []model.Session {
+	transcript := map[string]bool{}
+	logs := false
+	for _, s := range ss {
+		if isCodexHistory(s.Path) {
+			logs = true
+		} else {
+			transcript[s.Harness+":"+s.ID] = true
+		}
+	}
+	if !logs {
+		return ss
+	}
+	out := make([]model.Session, 0, len(ss))
+	for _, s := range ss {
+		if isCodexHistory(s.Path) {
+			key := s.Harness + ":" + s.ID
+			if transcript[key] {
+				continue
+			}
+			if meta, ok := held[key]; ok && meta.Path != "" && !isCodexHistory(meta.Path) {
+				continue
+			}
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // isZCodeSnapshot reports whether a ZCode session's path is a snapshot an
@@ -4087,7 +4230,7 @@ func updateIndexOnce(dir, harness, scope string, files map[string]FileState, for
 		}
 		return nil
 	}
-	if len(removed) == 0 && !rewritten && canAppendIncremental(changed, old.Files) {
+	if len(removed) == 0 && !rewritten && canAppendIncremental(changed, old.Files) && !promptLogTakeover(changed, old.Files, old.Sessions) {
 		filesTouched, messages, unreadable, err := appendIncremental(dir, harness, scope, old, files, changed)
 		if IsCorrupt(err) {
 			if progress != nil {
@@ -4140,7 +4283,7 @@ func updateIndexOnce(dir, harness, scope string, files map[string]FileState, for
 		}
 	}
 	take := func(p string, ss []model.Session) {
-		ss = sources.FilterSessions(filterTombstoned(ss))
+		ss = dropShadowedPrompts(sources.FilterSessions(filterTombstoned(ss)), old.Sessions)
 		for _, s := range ss {
 			keysFrom[p] = append(keysFrom[p], s.Harness+":"+s.ID)
 		}
@@ -4221,6 +4364,9 @@ func updateIndexOnce(dir, harness, scope string, files map[string]FileState, for
 	for _, s := range replacements {
 		replaceKeys[s.Harness+":"+s.ID] = true
 	}
+	// A transcript arriving for a session held from a prompt log alone: the
+	// log's records for it go, and the row starts over from the transcript.
+	takeovers := promptLogTakeovers(replacements, old.Sessions)
 	aiderHeld := aiderStarts(replacements)
 	// A kept file whose session arrived again from another path is a rename,
 	// not a cleanup: the client moved the transcript, and keeping the old copy
@@ -4298,7 +4444,7 @@ func updateIndexOnce(dir, harness, scope string, files map[string]FileState, for
 	// keyed on it — the embedding sidecar — that the file it measured was still
 	// there (#1357). Only appendIncremental, which appends in place, may keep a
 	// generation.
-	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(),
+	m := Manifest{Version: version, KeptDated: true, Format: onDiskFormat, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), SourcesReadAt: time.Now(), ReadZone: zoneFingerprint(),
 		Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: old.ExportWatermarks, ExportBoundary: old.ExportBoundary, ImportedRecords: old.ImportedRecords,
 		Compactions: cloneCompactions(old.Compactions),
@@ -4389,7 +4535,8 @@ func updateIndexOnce(dir, harness, scope string, files map[string]FileState, for
 		// And only when the pass read that store whole: a store read from its
 		// watermark hands back the new turns alone, so dropping the rest by key
 		// would take the earlier turns of every continued session (#2033).
-		if removed[r.SourcePath] || (changed[r.SourcePath].Path != "" && !fromStore && !leftItsFile(r, replaceKeys, old.Sessions[r.Key], aiderHeld) && !keptThroughCompaction(r, compacted)) || (fromStore && readWholeThisPass(r) && storeKeys[r.Key]) {
+		if removed[r.SourcePath] || (changed[r.SourcePath].Path != "" && !fromStore && !leftItsFile(r, replaceKeys, old.Sessions[r.Key], aiderHeld) && !keptThroughCompaction(r, compacted)) || (fromStore && readWholeThisPass(r) && storeKeys[r.Key]) ||
+			(takeovers[r.Key] && isCodexHistory(r.SourcePath)) {
 			dropped[r.Key] = true
 			return
 		}
@@ -4438,6 +4585,9 @@ func updateIndexOnce(dir, harness, scope string, files map[string]FileState, for
 		if !ok {
 			// The row may exist only in the manifest being replaced.
 			held = old.Sessions[key]
+			if takeovers[key] {
+				held = SessionMeta{}
+			}
 		}
 		// A renamed transcript arrives as one removed path and one added path
 		// in the same pass, so the path deja holds is the one that went away.
@@ -4746,6 +4896,7 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 	m.Scope = scope
 	m.BuiltAt = time.Now()
 	m.SourcesReadAt = m.BuiltAt
+	m.ReadZone = zoneFingerprint()
 	m.Files = files
 	m.Redacted = 0
 	carryRedactions(&m, old, map[string]bool{})
@@ -4776,7 +4927,18 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 			}
 			continue
 		}
-		ss = sources.FilterSessions(filterTombstoned(ss))
+		ss = dropShadowedPrompts(sources.FilterSessions(filterTombstoned(ss)), m.Sessions)
+		// A prompt whose transcript has not landed yet is read again next pass,
+		// from the same offset, rather than indexed from the log now and taken
+		// over by a full rewrite when the transcript arrives.
+		if isCodexHistory(p) && waitsForTranscript(ss, m.Sessions, time.Now()) {
+			if known {
+				m.Files[p] = of
+			} else {
+				delete(m.Files, p)
+			}
+			continue
+		}
 		// Scrub before anything is derived from the text, as the other two paths
 		// do. Redacting per message inside the write loop below left the derived
 		// fields — the friction signatures especially — hashed from the raw

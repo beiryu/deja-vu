@@ -91,11 +91,7 @@ func AiderFiles() []string {
 // AiderProjectsPath is the list of directories `deja aider` has started aider
 // in, one per line.
 func AiderProjectsPath() string {
-	base := os.Getenv("XDG_CONFIG_HOME")
-	if base == "" {
-		base = filepath.Join(Home(), ".config")
-	}
-	return filepath.Join(base, "deja", "aider-projects")
+	return filepath.Join(ConfigDir(), "aider-projects")
 }
 
 func aiderProjects() []string {
@@ -344,6 +340,9 @@ func ParseAiderFile(path string) ([]model.Session, error) {
 		if !inFence && strings.HasPrefix(line, aiderSessionMark) {
 			endSession()
 			idx++
+			// aider writes its local wall clock with no zone, so it is read in
+			// this machine's zone. After a zone change the index reads them
+			// again, so a kept index matches a rebuild (#5053).
 			ts, _ := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(strings.TrimPrefix(line, aiderSessionMark)), time.Local)
 			id := aiderSessionID(path, ts, idx, starts)
 			cur = &model.Session{Harness: "aider", ID: id, Project: project, Path: path, Started: ts, Updated: ts}

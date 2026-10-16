@@ -2727,7 +2727,7 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 	if at := index.ManifestSourcesReadAt(dir); at.IsZero() {
 		read = ", stores never read"
 	} else if fi, err := os.Stat(filepath.Join(dir, "manifest.gob")); err == nil && fi.ModTime().Sub(at) > time.Hour {
-		read = ", stores read " + at.Format("2006-01-02 15:04")
+		read = ", stores read " + at.Local().Format("2006-01-02 15:04")
 	}
 	fmt.Fprintf(w, "  status   built (size=%s, updated=%s%s)\n", humanBytes(pathSize(dir)), updated, read)
 	// An index written by an older format is unreadable to this binary: the
@@ -2944,13 +2944,21 @@ func reportPath(p string) string {
 	return strings.Join(parts, ", ")
 }
 
-// freshHomePath says whether a missing path lies inside the home directory
-// below a directory deja can write, so a build would simply create it. A
-// mount point that went away leaves its path outside the home, or under a
-// directory nothing here can write.
+// freshHomePath says whether a missing path lies below a directory deja can
+// write, so a build would simply create it. A mount point that went away
+// leaves its path under a directory nothing here can write, or under an empty
+// one outside the home: the mount point itself. A DEJA_INDEX_DIR under /tmp
+// or a project directory was read as an unmounted disk before (#5057).
 func freshHomePath(p string) bool {
 	a := nearestExistingDir(p)
-	return a != "" && underHome(a) != a && dirWritable(a)
+	if a == "" || !dirWritable(a) {
+		return false
+	}
+	if underHome(a) != a {
+		return true
+	}
+	entries, err := os.ReadDir(a)
+	return err == nil && len(entries) > 0
 }
 
 // underHome contracts a home-prefixed path to ~, and leaves everything else
