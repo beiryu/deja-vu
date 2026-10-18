@@ -78,9 +78,10 @@ func runRestore(dir string, args []string, stdout io.Writer) error {
 			if strings.HasPrefix(args[i], "-") {
 				return unknownFlag("restore", args[i], restoreFlags)
 			}
-			if path == "" {
-				path = args[i]
+			if path != "" {
+				return fmt.Errorf("restore accepts one path, got extra argument %q", args[i])
 			}
+			path = args[i]
 		}
 	}
 	if path == "" {

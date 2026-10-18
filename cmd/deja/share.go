@@ -27,6 +27,9 @@ func runShare(dir string, args []string, w io.Writer) error {
 			return fmt.Errorf("share: unknown flag %q — share writes to stdout (redirect it), and `deja promote <id> --to <path>` is the one that writes a file", a)
 		}
 	}
+	if len(args) > 1 {
+		return fmt.Errorf("share accepts one session id, got extra argument %q", args[1])
+	}
 	// An empty prefix used to match the first session there is, so `deja share
 	// "$ID"` with the variable unset printed a shareable digest of a session
 	// nobody chose (#2259). The lookup refuses one now; this says which

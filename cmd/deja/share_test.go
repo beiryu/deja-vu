@@ -58,6 +58,12 @@ func TestShareRefusesFlagsItCannotHonour(t *testing.T) {
 		t.Errorf("share --json was searched as a session prefix: %v", err)
 	}
 
+	// A second positional is refused, not dropped.
+	_, err = captureRun(t, "share", "loc", "extra")
+	if err == nil || !strings.Contains(err.Error(), "extra") {
+		t.Errorf("share dropped a second argument without a word: %v", err)
+	}
+
 	// The ordinary share is untouched.
 	got, err := captureRun(t, "share", "loc")
 	if err != nil {
