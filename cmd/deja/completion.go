@@ -439,7 +439,7 @@ _deja() {
       fi
       ;;
     fix|friction|tests)
-      _arguments '--limit=[max results]:count:' '--json[print JSON]'
+      _arguments '--limit[max results]:count:' '--json[print JSON]'
       ;;
     brief|check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|version|warmup)
       ;;
