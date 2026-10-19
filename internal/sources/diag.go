@@ -79,6 +79,14 @@ func DiagNoZstdPaths() map[string]bool {
 	return maps.Clone(diagZstdMissing)
 }
 
+// DiagRestoreNoZstd puts back paths DiagSnapshot cleared, for a write that
+// must not consume them before the pass that read them is done.
+func DiagRestoreNoZstd(paths map[string]bool) {
+	diagMu.Lock()
+	defer diagMu.Unlock()
+	maps.Copy(diagZstdMissing, paths)
+}
+
 // DiagMalformedCounts returns the malformed-line counts accumulated so far
 // without clearing them. The index narrates each store as it lands, which is
 // before the manifest fold that drains these counters (#1993).

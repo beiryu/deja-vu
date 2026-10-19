@@ -1654,7 +1654,11 @@ func publishNewestFirst(dir string, ss []model.Session, progress io.Writer) {
 	// them, and a line saying "3 empty transcripts" must count the whole
 	// corpus rather than this slice of it.
 	wasEmptied, wasCollisions, wasMerged := emptied.Load(), collisions.Load(), merged.Load()
+	// The same goes for the rollouts waiting for zstd: the manifest write
+	// drains them, and the full build has to fold them again.
+	noZstd := sources.DiagNoZstdPaths()
 	err := writeSessions(tmp, dir, newest, nil, "")
+	sources.DiagRestoreNoZstd(noZstd)
 	emptied.Store(wasEmptied)
 	collisions.Store(wasCollisions)
 	merged.Store(wasMerged)
