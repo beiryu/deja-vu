@@ -46,7 +46,23 @@ const (
 	TierSemantic = query.TierSemantic
 	TierStemmed  = "stemmed"
 	TierError    = query.TierError
+
+	SortRelevance = query.SortRelevance
+	SortDate      = query.SortDate
 )
+
+// ByDate puts hits newest first, keeping the ranked order between sessions
+// of the same moment. On the relevance tier the sessions that hold every
+// word stay ahead of the ones holding some, each part newest first: dated in
+// one run, a tail of newer partial matches pushed the real ones off the page.
+func ByDate(hits []Hit) {
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].Strict != hits[j].Strict {
+			return hits[i].Strict
+		}
+		return hits[i].Session.Updated.After(hits[j].Session.Updated)
+	})
+}
 
 func QueryParts(q string) (terms []string, phrases []string) { return query.QueryParts(q) }
 
@@ -68,6 +84,11 @@ type searchJSONEnvelope struct {
 	// Total is how many sessions matched before the cap; Capped says whether
 	// the cap hid any. Counting the returned hits alone measures the cap.
 	Total int `json:"total"`
+	// TotalEstimated says total counts sessions the search did not read by an
+	// estimate: the text check turned down sessions the postings named (a
+	// quoted phrase over common words), and the unread ones were too many to
+	// check.
+	TotalEstimated bool `json:"total_estimated,omitempty"`
 	// Strict is how many of the hits hold every word of the query. It appears
 	// on the relevance tier, where a thin strict answer is merged into the
 	// ranking and published under a label that means nothing matched: a
@@ -162,7 +183,7 @@ type bm25Document struct {
 // a parts match first, then either a whole-query substring count for a single
 // bare token or a per-token count, plus any quoted phrases.
 func countIn(text, low string, qtoks, phrases []string, variants map[string][]string) int {
-	if !MatchesParts(text, qtoks, phrases, variants) {
+	if !query.MatchesLowered(low, qtoks, phrases, variants) {
 		return 0
 	}
 	if len(qtoks) == 1 && len(phrases) == 0 && variants == nil {
@@ -196,10 +217,10 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 	qtoksFolded, phrasesFolded := QueryParts(cjkfold.String(o.Query))
 	if o.Regex {
 		var err error
-		re, err = regexp.Compile("(?i)" + o.Query)
+		re, err = compileQueryRegex(o.Query)
 		if err != nil {
-			// The (?i) prefix is deja's, not the user's. Reporting the compile
-			// error verbatim echoes `(?i)(` back at someone who typed `(`, so
+			// The (?im) prefix is deja's, not the user's. Reporting the compile
+			// error verbatim echoes `(?im)(` back at someone who typed `(`, so
 			// re-compile their pattern alone for a message that names what they
 			// actually wrote.
 			if _, uerr := regexp.Compile(o.Query); uerr != nil {
@@ -234,6 +255,10 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 	df := make([]int, len(qtoks))
 	corpusDocuments := 0
 	corpusLength := 0
+	// The sessions read to check the estimate retrieval counted the unread
+	// ones at, measured apart.
+	sampleDF := make([]int, len(qtoks))
+	sampleDocuments, sampleLength, sampleEstimate := 0, 0, 0.0
 	for _, s := range merged {
 		if o.Harness != "" && s.Harness != o.Harness {
 			continue
@@ -256,7 +281,7 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 		tier := setTier(o)
 		doc := bm25Document{hit: Hit{Session: s, Tier: tier}, termCount: make([]int, len(qtoks)), userCount: make([]int, len(qtoks))}
 		if s.Title != "" && len(qtoks) > 0 {
-			titleLow := strings.ToLower(s.Title)
+			titleLow := lower(s.Title)
 			for _, tok := range qtoks {
 				if strings.Contains(titleLow, tok) {
 					doc.titleHits++
@@ -285,7 +310,7 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 			// being asked (#2067). Removed from matching only; the line stays
 			// in the transcript for `deja how` and `deja fix`.
 			text := withoutOwnCallLog(m.Text)
-			low := strings.ToLower(text)
+			low := lower(text)
 			c := 0
 			// windowText and windowToks are the pair proximity is measured on: the
 			// surface text and the query's own words, except where the match came from
@@ -429,14 +454,47 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 		}
 		corpusDocuments++
 		corpusLength += doc.length
+		var sampled bool
+		if o.Unread != nil {
+			var est float64
+			est, sampled = o.Unread.Sample[doc.hit.Session.Harness+":"+doc.hit.Session.ID]
+			if sampled {
+				sampleDocuments++
+				sampleLength += doc.length
+				sampleEstimate += est
+			}
+		}
 		for i, n := range doc.termCount {
 			if n > 0 {
 				df[i]++
+				if sampled {
+					sampleDF[i]++
+				}
 			}
 		}
 		if doc.hit.Count > 0 {
 			documents = append(documents, doc)
 		}
+	}
+	// The sessions retrieval did not read still belong to the corpus: their
+	// count and length are what BM25's figures are made of, and leaving them
+	// out would score the pool as if it were the whole match. Their length is
+	// an estimate, scaled by how far the same estimate was off on the sample
+	// read alongside the pool.
+	if u := o.Unread; u != nil && u.Sessions > 0 && corpusDocuments > 0 {
+		scale := 1.0
+		share := func(i int) float64 { return float64(df[i]) / float64(corpusDocuments) }
+		if sampleDocuments > 0 {
+			if sampleEstimate > 0 {
+				scale = float64(sampleLength) / sampleEstimate
+			}
+			share = func(i int) float64 { return float64(sampleDF[i]) / float64(sampleDocuments) }
+		}
+		corpusLength += int(u.Length * scale)
+		for i := range df {
+			df[i] += int(math.Round(share(i) * float64(u.Sessions)))
+		}
+		corpusDocuments += u.Sessions
 	}
 	avgLength := 0.0
 	if corpusDocuments > 0 {
@@ -463,7 +521,7 @@ func renderSnippets(hits []Hit, o Options, n int) {
 		// Already compiled once in runScored, and a hit only reaches here if
 		// that compile succeeded, so a failure now is not reportable and not
 		// possible: fall back to the plain highlighter.
-		re, _ = regexp.Compile("(?i)" + o.Query)
+		re, _ = compileQueryRegex(o.Query)
 	}
 	if n < 0 || n > len(hits) {
 		n = len(hits)
@@ -503,6 +561,9 @@ type Results struct {
 	// relevance. relevance means nothing matched and these are the nearest
 	// sessions, which is not the same kind of answer.
 	Tier string
+	// Estimated says Total counts sessions retrieval did not read by an
+	// estimate (query.Unread.Estimated).
+	Estimated bool
 }
 
 // RunDetailed is Run plus the numbers the cap would otherwise hide.
@@ -521,11 +582,50 @@ func RunDetailedKeeping(ss []model.Session, o Options, keep func([]Hit) []Hit) (
 	if keep != nil {
 		hits = keep(hits)
 	}
-	r := Results{Hits: hits, Total: len(hits), Tier: setTier(o)}
-	r.Hits, r.Capped = CapHits(hits, o.Limit, o.All)
+	r := Results{Total: len(hits), Tier: setTier(o)}
+	if o.Sort == SortDate {
+		ByDate(hits)
+		// The earlier-attempt marks were taken over the ranking's head; the
+		// page is the date order's head now.
+		renderSnippets(hits, o, earlierAttemptWindow)
+		markEarlierAttempts(hits)
+		// The sample read to check the unread estimate is older than every
+		// session of a date pool, and the unread ones between them were not
+		// read: a sampled hit on the page skips them. It still counts.
+		if u := o.Unread; u != nil && (u.Sessions > 0 || u.Estimated) && len(u.Sample) > 0 {
+			kept := hits[:0:0]
+			for _, h := range hits {
+				if _, sampled := u.Sample[h.Session.Harness+":"+h.Session.ID]; !sampled {
+					kept = append(kept, h)
+				}
+			}
+			if len(kept) < len(hits) {
+				r.Capped = true
+			}
+			hits = kept
+		}
+	}
+	var capped bool
+	r.Hits, capped = CapHits(hits, o.Limit, o.All)
+	r.Capped = r.Capped || capped
+	// The unread sessions matched as well. What the trust policy withholds
+	// on Options.Activation is already out of them, so the total does not
+	// count a session the page could never show.
+	if o.Unread != nil && o.Unread.Sessions > 0 {
+		r.Total += o.Unread.Sessions
+		r.Capped = true
+	}
+	// An estimate of none left over is still one: the sample held no match,
+	// which says few, not none, and --all reads them all.
+	if o.Unread != nil && o.Unread.Estimated {
+		r.Estimated, r.Capped = true, true
+	}
 	renderSnippets(r.Hits, o, -1)
 	return r, nil
 }
+
+// DefaultLimit is how many hits a search shows when no flag says.
+const DefaultLimit = 15
 
 // CapHits bounds what a search hands back, with the default a reader gets when
 // they pass no flag. It lives here rather than inside RunDetailed because the
@@ -534,7 +634,7 @@ func RunDetailedKeeping(ss []model.Session, o Options, keep func([]Hit) []Hit) (
 // sessions for `--limit 3`, and fifty for no flag at all (#3345).
 func CapHits(hits []Hit, limit int, all bool) ([]Hit, bool) {
 	if limit == 0 && !all {
-		limit = 15
+		limit = DefaultLimit
 	}
 	if limit > 0 && len(hits) > limit {
 		return hits[:limit], true
@@ -583,7 +683,7 @@ func markEarlierAttempts(hits []Hit) {
 	for i := 0; i < n; i++ {
 		set := map[string]bool{}
 		for _, sn := range hits[i].Snippets {
-			for _, w := range strings.Fields(strings.ToLower(sn)) {
+			for _, w := range strings.Fields(lower(sn)) {
 				if len(w) > 3 {
 					set[w] = true
 				}
@@ -1198,7 +1298,7 @@ func decidesSomething(s model.Session) bool {
 		if m.Role == "user" || m.Role == "" || m.Role == roleToolOutput {
 			continue
 		}
-		low := strings.ToLower(m.Text)
+		low := lower(m.Text)
 		for _, phrase := range decisionPhrases {
 			if strings.Contains(low, phrase) {
 				return true
@@ -1525,17 +1625,18 @@ func Print(w io.Writer, hits []Hit, o Options) {
 		// every fallback path emitted an object, so a consumer had to handle
 		// two contracts and could not tell which it had until it looked.
 		_ = json.NewEncoder(w).Encode(searchJSONEnvelope{
-			SchemaVersion: jsonout.Version,
-			Tier:          setTier(o),
-			Total:         o.Total,
-			Strict:        o.Strict,
-			Capped:        o.Capped,
-			Withheld:      o.PolicyWithheld,
-			Hits:          hits,
-			Fuzzy:         o.Fuzzy,
-			Stemmed:       o.Stemmed,
-			Semantic:      o.Semantic,
-			Variants:      o.FuzzyVariants,
+			SchemaVersion:  jsonout.Version,
+			Tier:           setTier(o),
+			Total:          o.Total,
+			TotalEstimated: o.TotalEstimated,
+			Strict:         o.Strict,
+			Capped:         o.Capped,
+			Withheld:       o.PolicyWithheld,
+			Hits:           hits,
+			Fuzzy:          o.Fuzzy,
+			Stemmed:        o.Stemmed,
+			Semantic:       o.Semantic,
+			Variants:       o.FuzzyVariants,
 		})
 		return
 	}
@@ -1724,7 +1825,7 @@ func tierLabel(h Hit) string {
 }
 
 func variantDetail(text string, terms []string, variants map[string][]string) string {
-	low := strings.ToLower(text)
+	low := lower(text)
 	for _, term := range terms {
 		for _, variant := range variants[term] {
 			// A term that matched itself is an exact hit, not a variant —
@@ -1972,7 +2073,7 @@ func PrintContextStyled(w io.Writer, s model.Session, query string, color bool, 
 
 func printContextBody(w io.Writer, s model.Session, query string) {
 	s = withoutHarnessEnvelopes(s)
-	qlow := strings.ToLower(query)
+	qlow := lower(query)
 	terms, phrases := QueryParts(query)
 	budget := ContextBudget
 	// The reply to an included turn comes with it. Every user turn was kept
@@ -2109,7 +2210,7 @@ func contextPartHits(text string, parts []string) []int {
 	if len(parts) == 0 {
 		return nil
 	}
-	low := strings.ToLower(text)
+	low := lower(text)
 	hits := make([]int, len(parts))
 	for i, p := range parts {
 		hits[i] = strings.Count(low, p)
@@ -2237,6 +2338,9 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		// window can sit where the identifying words are rather than where the
 		// common ones repeat.
 		weight float64
+		// msg is the turn's place in the session, so the line after a cut
+		// window can say whether the last turn was shown.
+		msg int
 	}
 	// The include callback carries state from turn to turn (prevKept), so which
 	// turns are kept is decided in one ordered pass. Rendering them is not:
@@ -2247,13 +2351,23 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 	// from predicted ones and the window moves. Spreading the same renders
 	// across cores keeps the output identical by construction.
 	var kept []contextTurn
+	var keptAt []int
 	parts := 0
-	for _, m := range s.Messages {
+	// Turns the include rule passed over, and the session's last turn: both
+	// are what the line under a cut window reports.
+	skipped, last := 0, -1
+	for i, m := range s.Messages {
 		if isWorkRecord(m.Role) {
 			continue
 		}
+		if strings.TrimSpace(m.Text) != "" {
+			last = i
+		}
 		ok, hits := include(m)
 		if !ok {
+			if strings.TrimSpace(m.Text) != "" {
+				skipped++
+			}
 			continue
 		}
 		if len(hits) > parts {
@@ -2266,6 +2380,7 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 			}
 		}
 		kept = append(kept, contextTurn{role: m.Role, raw: raw, hits: hits})
+		keptAt = append(keptAt, i)
 	}
 	weights := contextTurnWeights(kept, parts)
 	rendered := renderContextTurns(kept)
@@ -2275,10 +2390,20 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		chunks = append(chunks, chunk{fmt.Sprintf("\n## %s\n\n%s\n", k.role, text), weights[i]})
+		chunks = append(chunks, chunk{fmt.Sprintf("\n## %s\n\n%s\n", k.role, text), weights[i], keptAt[i]})
 	}
 	if len(chunks) == 0 {
 		return 0
+	}
+	// A window that holds less than the session says so, and the room for
+	// saying it comes out of the budget before the window is chosen: 8 KB that
+	// ended mid-word with nothing after it read as the whole session (#5392).
+	total := 0
+	for _, c := range chunks {
+		total += len(c.text)
+	}
+	if skipped > 0 || total > budget {
+		budget = max(0, budget-contextCutReserve)
 	}
 	// Anchor the budget window where the matched turns are densest, with one turn
 	// of lead-in (usually the question when the answer is what matched). Walking
@@ -2309,23 +2434,81 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 	if best > 0 && start > 0 && span+len(chunks[start-1].text) <= budget {
 		start--
 	}
-	written := 0
-	for _, c := range chunks[start:] {
+	written, end, cutLeft := 0, start, 0
+	for i, c := range chunks[start:] {
 		if written >= budget {
 			break
 		}
 		text := c.text
 		if written+len(text) > budget {
-			cut := max(0, budget-written)
-			for cut > 0 && !utf8.RuneStart(text[cut]) {
-				cut--
+			cut := cutAtWord(text, budget-written)
+			// A heading and a few words is not a turn shown; it is left out
+			// and counted with the others.
+			if cut < strings.Index(text, "\n\n")+2+contextCutMinBody {
+				break
 			}
-			text = text[:cut]
+			cutLeft = len(text) - cut
+			text = strings.TrimRight(text[:cut], " \t\n")
 		}
 		fmt.Fprint(w, text)
 		written += len(text)
+		end = start + i + 1
+	}
+	if written == 0 {
+		return 0
+	}
+	id := SafeLine(s.ID)
+	if cutLeft > 0 {
+		note := fmt.Sprintf(" …\n[this turn is cut here, %s more of it left out — `deja show %s` prints the rest]\n", approxSize(cutLeft), id)
+		fmt.Fprint(w, note)
+		written += len(note)
+	}
+	shown := end - start
+	if left := start + len(chunks) - end + skipped; left > 0 || cutLeft > 0 {
+		lastShown := chunks[end-1].msg == last
+		final := ""
+		switch {
+		case !lastShown:
+			final = ", the last turn not among them"
+		case cutLeft > 0:
+			final = ", the last one cut short"
+		}
+		note := fmt.Sprintf("\n[%d of %d turns shown%s — `deja show %s` prints every turn]\n", shown, shown+left, final, id)
+		fmt.Fprint(w, note)
+		written += len(note)
 	}
 	return written
+}
+
+// contextCutReserve is the room kept for the two lines a cut window prints,
+// and contextCutMinBody the least of a turn worth printing before its marker.
+const (
+	contextCutReserve = 320
+	contextCutMinBody = 160
+)
+
+// cutAtWord is where to cut text to fit n bytes: the last space within reach,
+// or the last whole rune when a word runs longer than that.
+func cutAtWord(text string, n int) int {
+	if n >= len(text) {
+		return len(text)
+	}
+	cut := max(0, n)
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	if i := strings.LastIndexAny(text[:cut], " \t\n"); i > 0 && i >= cut-200 {
+		return i
+	}
+	return cut
+}
+
+// approxSize is a byte count the way a reader sizes text.
+func approxSize(n int) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d bytes", n)
+	}
+	return fmt.Sprintf("%d KB", (n+512)/1024)
 }
 
 func Recent(ss []model.Session, n int) []model.Session {
@@ -2335,6 +2518,14 @@ func Recent(ss []model.Session, n int) []model.Session {
 		out = out[:n]
 	}
 	return out
+}
+
+// compileQueryRegex compiles a --re pattern the way grep reads one: ignoring
+// case, with ^ and $ anchored at each line. A message is often many lines of
+// tool output, and anchoring at the whole text missed `^panic:` on any line
+// but the first.
+func compileQueryRegex(q string) (*regexp.Regexp, error) {
+	return regexp.Compile("(?im)" + q)
 }
 
 // A pattern that can match the empty string — `x*`, `foo?`, `(a|)` — matches
@@ -2352,21 +2543,42 @@ func countRegex(re *regexp.Regexp, s string) int {
 }
 
 func snippet(s, q string, re *regexp.Regexp) string {
-	s = proseForSnippet(s)
+	return snippetAt(s, q, re, matchedLine(q, re))
+}
+
+// snippetAt is snippet with the test for a line that holds the match given
+// separately. The error tier centres on nothing in particular (q is empty) but
+// still knows which lines the reader pasted.
+func snippetAt(s, q string, re *regexp.Regexp, matched func(string) bool) string {
+	lines, first := proseLinesKeeping(s, matched)
+	s = strings.Join(lines, " ")
 	r := []rune(s)
 	idx := 0
+	if re == nil && q == "" && first > 0 {
+		// Nothing to centre on but the line the paste named: start there, so
+		// a panic forty lines into a test log is in the window.
+		for _, line := range lines[:first] {
+			idx += utf8.RuneCountInString(line) + 1
+		}
+	}
 	if re != nil {
 		// Anchor on the first match that has width; a zero-width one points at
-		// no passage in particular (#1606).
-		for _, loc := range re.FindAllStringIndex(s, -1) {
-			if loc[1] > loc[0] {
-				idx = utf8.RuneCountInString(s[:loc[0]])
-				break
+		// no passage in particular (#1606). Line by line, because the excerpt
+		// joins lines and a ^ or $ in the pattern is anchored at each one.
+		at := 0
+	lineScan:
+		for _, line := range lines {
+			for _, loc := range re.FindAllStringIndex(line, -1) {
+				if loc[1] > loc[0] {
+					idx = at + utf8.RuneCountInString(line[:loc[0]])
+					break lineScan
+				}
 			}
+			at += utf8.RuneCountInString(line) + 1
 		}
 	} else {
-		low := strings.ToLower(s)
-		b := densestMention(low, strings.ToLower(q))
+		low := lower(s)
+		b := densestMention(low, lower(q))
 		if b < 0 {
 			toks := query.Tokens(q)
 			// Centre on where the query's words meet, not on the first one to
@@ -2617,12 +2829,19 @@ func short(s string) string {
 	tail := width - head - 1
 	return string(r[:head]) + "…" + string(r[len(r)-tail:])
 }
+
+// yoPattern quotes s for a regexp in which е and ё match either letter, as
+// the search that found the text treats them as one.
+func yoPattern(s string) string {
+	return strings.NewReplacer("е", "[её]", "ё", "[её]").Replace(regexp.QuoteMeta(lower(s)))
+}
+
 func highlight(s, q string, isRe bool, color bool) string {
 	if !color {
 		return s
 	}
 	if isRe {
-		re, err := regexp.Compile("(?i)" + q)
+		re, err := compileQueryRegex(q)
 		if err == nil {
 			return re.ReplaceAllStringFunc(s, func(x string) string {
 				// Zero-width match: colouring it wraps an escape pair around
@@ -2634,8 +2853,8 @@ func highlight(s, q string, isRe bool, color bool) string {
 			})
 		}
 	}
-	if strings.Contains(strings.ToLower(s), strings.ToLower(q)) {
-		return regexp.MustCompile(`(?i)`+regexp.QuoteMeta(q)).ReplaceAllStringFunc(s, func(x string) string { return cMatch + x + cReset })
+	if strings.Contains(lower(s), lower(q)) {
+		return regexp.MustCompile(`(?i)`+yoPattern(q)).ReplaceAllStringFunc(s, func(x string) string { return cMatch + x + cReset })
 	}
 	toks := query.Tokens(q)
 	if len(toks) == 0 {
@@ -2643,7 +2862,7 @@ func highlight(s, q string, isRe bool, color bool) string {
 	}
 	parts := make([]string, 0, len(toks))
 	for _, t := range toks {
-		parts = append(parts, regexp.QuoteMeta(t))
+		parts = append(parts, yoPattern(t))
 	}
 	return regexp.MustCompile(`(?i)(`+strings.Join(parts, "|")+`)`).ReplaceAllStringFunc(s, func(x string) string { return cMatch + x + cReset })
 }
@@ -2882,7 +3101,7 @@ var creditOpeners = []string{"déjà vu:", "deja vu:", "deja-vu recalled:", "dej
 // It runs mid-text rather than per line because the credit is written into the
 // middle of a reply: "No files changed. No benchmarks run. deja-vu recalled: …".
 func withoutOwnCredit(text string) string {
-	low := strings.ToLower(text)
+	low := lower(text)
 	for _, opener := range creditOpeners {
 		for {
 			i := strings.Index(low, opener)
@@ -2898,13 +3117,33 @@ func withoutOwnCredit(text string) string {
 				end = i + j + 1
 			}
 			text = strings.TrimSpace(text[:i]) + " " + strings.TrimSpace(text[end:])
-			low = strings.ToLower(text)
+			low = lower(text)
 		}
 	}
 	return strings.TrimSpace(text)
 }
 
 func proseForSnippet(s string) string {
+	return strings.Join(proseLines(s), " ")
+}
+
+// proseLines is the excerpt's text as the lines it is joined from, each with
+// its whitespace collapsed.
+func proseLines(s string) []string {
+	lines, _ := proseLinesKeeping(s, nil)
+	return lines
+}
+
+// proseLinesKeeping is proseLines that keeps a dump line holding the match
+// when no other line holds it, and also returns the index of the first kept
+// line that holds the match, or -1.
+//
+// The dump filters are there for the noise around an answer, and a line they
+// recognise can be the answer: an agent's test run panics, the agent searches
+// `assignment to entry in nil map`, and the excerpt showed the stack frames
+// and the FAIL summary while dropping the `panic:` line itself as a dump. The
+// line the reader searched for is the one line an excerpt must not lose.
+func proseLinesKeeping(s string, matched func(string) bool) ([]string, int) {
 	s = redact.SafeForDisplay(s)
 	// Neither the harness nor deja is a witness. An excerpt is offered as
 	// something someone said about the subject, and measured over twelve
@@ -2913,21 +3152,96 @@ func proseForSnippet(s string) string {
 	// coming back as evidence. Both are stripped where they sit, so a message
 	// that carries a person's words around them keeps the words.
 	s = withoutOwnCredit(digest.StripClosedHarnessBlocks(s))
-	var keep []string
+	type cand struct {
+		line      string
+		dump, hit bool
+	}
+	var cands []cand
+	proseHit := false
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || looksNumbered(line) || looksToolDump(line) || digest.IsListingDump(line) {
+		if line == "" {
 			continue
 		}
-		keep = append(keep, line)
+		line = strings.Join(strings.Fields(line), " ")
+		dump := looksNumbered(line) || looksToolDump(line) || digest.IsListingDump(line)
+		// Asked of every line that would be dropped, and of the others only
+		// until one of them holds the match.
+		hit := matched != nil && (dump || !proseHit) && matched(line)
+		if hit && !dump {
+			proseHit = true
+		}
+		cands = append(cands, cand{line, dump, hit})
 	}
-	out := strings.Join(keep, " ")
-	out = strings.Join(strings.Fields(out), " ")
-	if out == "" {
-		out = strings.Join(strings.Fields(redact.SafeForDisplay(s)), " ")
+	var keep []string
+	first := -1
+	for _, c := range cands {
+		// A dump line that matched stays only when no other line did: prose
+		// that says the same thing is the better excerpt.
+		if c.dump && (!c.hit || proseHit) {
+			continue
+		}
+		if c.hit && first < 0 {
+			first = len(keep)
+		}
+		keep = append(keep, c.line)
 	}
-	return out
+	if len(keep) == 0 {
+		if out := strings.Join(strings.Fields(redact.SafeForDisplay(s)), " "); out != "" {
+			keep = append(keep, out)
+		}
+	}
+	return keep, first
 }
+
+// matchedLine says whether an excerpt line holds what the reader searched for:
+// a width-having match of the pattern, the query as typed, at least half of
+// its words as whole words, or — for a pasted error — a line the paste itself
+// carries. Half rather than any: "to" and "in" are words of `panic: assignment
+// to entry in nil map`, and one of them is in every frame of the stack below it.
+func matchedLine(q string, re *regexp.Regexp) func(string) bool {
+	if re != nil {
+		return func(line string) bool {
+			for _, loc := range re.FindAllStringIndex(line, -1) {
+				if loc[1] > loc[0] {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	// Lines arrive redacted, so the paste is compared redacted too: a token in
+	// the error line is "[redacted]" on both sides.
+	lowQ := lower(strings.Join(strings.Fields(redact.SafeForDisplay(q)), " "))
+	toks := query.Tokens(q)
+	if len(toks) == 0 {
+		return nil
+	}
+	need := (len(toks) + 1) / 2
+	return func(line string) bool {
+		low := lower(line)
+		if strings.Contains(low, lowQ) {
+			return true
+		}
+		// A line of the paste, long enough to be an error and not a stray
+		// "FAIL" or "}" that any output carries.
+		if utf8.RuneCountInString(low) >= pastedLineMin && strings.Contains(lowQ, low) {
+			return true
+		}
+		n := 0
+		for _, t := range toks {
+			if containsWord(low, t) {
+				if n++; n >= need {
+					return true
+				}
+			}
+		}
+		return false
+	}
+}
+
+// pastedLineMin is how long a line must be to count as one the reader pasted.
+const pastedLineMin = 12
 
 func contextText(s string, matched bool) string {
 	s = redact.SafeForDisplay(s)
@@ -2952,7 +3266,12 @@ const TierRelevance = query.TierRelevance
 // each becomes one hit whose snippets are those messages — re-scoring them
 // against the paste's words (as the relevance tier would) throws away the
 // passage the tier found and can render a real match as "0 matches".
-func ErrorHits(ss []model.Session) []Hit {
+//
+// paste is what the reader pasted. It does not move the excerpt's centre, only
+// keeps the lines it carries from being dropped as dumps, and starts the
+// excerpt at the first of them.
+func ErrorHits(ss []model.Session, paste string) []Hit {
+	matched := matchedLine(paste, nil)
 	hits := make([]Hit, 0, len(ss))
 	for rank, s := range ss {
 		hit := Hit{Session: s, Tier: TierError, Count: len(s.Messages), Score: float64(len(ss) - rank)}
@@ -2960,7 +3279,7 @@ func ErrorHits(ss []model.Session) []Hit {
 			if strings.TrimSpace(m.Text) == "" {
 				continue
 			}
-			if sn := snippet(m.Text, "", nil); sn != "" {
+			if sn := snippetAt(m.Text, "", nil, matched); sn != "" {
 				hit.Snippets = append(hit.Snippets, sn)
 				hit.quoted = append(hit.quoted, m.Text)
 			}
@@ -2979,7 +3298,7 @@ func ErrorHits(ss []model.Session) []Hit {
 func sessionHolds(s model.Session, t string) bool {
 	folded := ""
 	for _, m := range s.Messages {
-		low := strings.ToLower(m.Text)
+		low := lower(m.Text)
 		if strings.Contains(low, t) {
 			return true
 		}
@@ -3045,6 +3364,7 @@ func RelevanceHitsWeighted(ss []model.Session, terms []string, idf map[string]fl
 		weight = termWeights(ss, terms)
 	}
 	hits := make([]Hit, len(ss))
+	set := newTermSet(terms)
 	// One session's score is read from that session alone, and lowercasing its
 	// messages is where the time goes: profiled on a real store, a recall
 	// answer spent 2.4 s in it and in the ranker's own copy of the same loop.
@@ -3074,30 +3394,23 @@ func RelevanceHitsWeighted(ss []model.Session, terms []string, idf map[string]fl
 			dump     bool
 		}
 		best := make([]msgScore, 0, 8)
+		found := make([]bool, len(terms))
+		var pos []int
 		for mi, m := range s.Messages {
 			// The same rule the scoring loop applies: a transcript's record of
 			// a call to deja is not something anyone said, and this tier is
 			// where the live miss came through — the scoring loop was fixed
 			// first and the hit arrived here instead (#2067).
-			low := strings.ToLower(withoutOwnCallLog(m.Text))
-			var foldedLow string
+			low := lower(withoutOwnCallLog(m.Text))
+			pos, _ = set.match(low, found, pos)
 			distinct := 0
 			weighted := 0.0
 			center := ""
 			// The rarest term a message holds is what names it, so it is what
 			// the excerpt gets centred on.
 			heaviest := 0.0
-			for _, t := range terms {
-				found := strings.Contains(low, t)
-				if !found {
-					if ft := cjkfold.String(t); ft != t || cjkfold.HasCJK(t) {
-						if foldedLow == "" {
-							foldedLow = cjkfold.String(low)
-						}
-						found = strings.Contains(foldedLow, ft)
-					}
-				}
-				if !found {
+			for ti, t := range terms {
+				if !found[ti] {
 					continue
 				}
 				distinct++
@@ -3328,3 +3641,6 @@ func unsafeForTerminal(r rune) bool {
 	}
 	return false
 }
+
+// lower is the text fold both sides of a match use: lowercase plus ё→е.
+func lower(s string) string { return query.Lower(s) }

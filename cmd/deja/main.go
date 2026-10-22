@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp/syntax"
 	"sort"
 	"strconv"
 	"strings"
@@ -60,6 +61,11 @@ func main() {
 	err := run(os.Args[1:])
 	if exe, exeErr := os.Executable(); exeErr == nil {
 		notice.finish(os.Stderr, exe)
+	}
+	var status exitStatus
+	if errors.As(err, &status) {
+		stopProfiling()
+		os.Exit(int(status))
 	}
 	if err != nil {
 		stopProfiling()
@@ -502,6 +508,18 @@ func cmdWarmup(dir string, rest []string) error {
 		}
 		return fmt.Errorf("warmup takes no arguments — got %q", a)
 	}
+	// warmup is what hooks and installs start; with automatic indexing off
+	// it reports the index instead of building it (#5385).
+	if index.Manual() {
+		if err := index.ManualStatus(dir); err != nil {
+			return err
+		}
+		if line := manualIndexLine(dir); line != "" {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		_, _ = writeCLISkill()
+		return nil
+	}
 	stop := publishBuildProgress(dir)
 	defer stop()
 	prepareFirstIndexGreeting(dir)
@@ -562,6 +580,18 @@ func cmdIndex(dir string, rest []string) error {
 			return unknownFlag("index", a, indexFlags)
 		}
 	}
+	// The detached warmup runs this command too. With automatic indexing off
+	// it is not the user asking, so it writes nothing; anything else here is
+	// the explicit build the switch leaves on (#5385).
+	if os.Getenv("DEJA_WARMUP_SENTINEL") != "" && index.Manual() {
+		clearWarmupSentinel()
+		return nil
+	}
+	defer index.AllowBuild()()
+	// Run by hand, it is also what turns search-only on or off (#5395).
+	if os.Getenv("DEJA_WARMUP_SENTINEL") == "" {
+		defer index.ApplySearchOnly()()
+	}
 	// Where the command reports that it worked. Nobody is watching a run out
 	// of a shell profile or a hook, and a line printed over the prompt on
 	// every new shell is the kind of thing that gets a tool uninstalled
@@ -586,7 +616,7 @@ func cmdIndex(dir string, rest []string) error {
 	// existed (#1021).
 	stopProgress := publishBuildProgress(dir)
 	index.SweepStaleTmp(dir)
-	fresh, n := index.UpToDate(dir, "")
+	fresh, n, check := index.CheckUpToDate(dir, "")
 	// A note bucket's id names the local day of whichever process indexed the
 	// line, so a `remember` under TZ=UTC and one under the machine's own zone
 	// split the same moment into two buckets. `show` tells the reader this
@@ -611,13 +641,17 @@ func cmdIndex(dir string, rest []string) error {
 		clearWarmupSentinel()
 		fmt.Fprintf(said, "deja: index is up to date (%d session%s)\n", n, pluralS(n))
 		printRetentionDue(said, time.Now())
+		// Up to date with what it could read: a path it may not read is
+		// still missing from recall on every run, not only the one that
+		// found it (#5393).
+		unread := sayUnreadable(dir)
 		// "Up to date" is the most misleading place to stay quiet about it:
 		// nothing changed on disk, so this is exactly where an exclusion set
 		// after the build looks applied and is not.
 		if index.ExclusionsChanged(dir) {
 			fmt.Fprintln(os.Stderr, "deja: the exclude list changed since this index was built — `deja index --rebuild` applies it to sessions already indexed")
 		}
-		return nil
+		return partialIndex(unread, 0)
 	}
 	stopProgress()
 	if !quiet {
@@ -630,7 +664,22 @@ func cmdIndex(dir string, rest []string) error {
 	// command then owed a closing line and had none, leaving "waiting for it
 	// to finish" as the last thing on screen (#1751).
 	progress := &countingWriter{w: said}
-	build := func() error { return index.Ensure(dir, "", force, progress) }
+	// Piped or under cron there is no live display, and a long run printed
+	// "indexing ..." and then nothing until the per-store counts: one line
+	// per phase says where it is (#5396). Not for the warmup, which
+	// publishes its phases to the status file.
+	phases := !quiet && !logoWanted(os.Stdout) && os.Getenv("DEJA_WARMUP_SENTINEL") == ""
+	skippedBefore := index.SkippedThisRun()
+	build := func() error {
+		if phases {
+			index.SetPhaseLines(said)
+			defer index.SetPhaseLines(nil)
+		}
+		if check != nil {
+			return index.EnsureChecked(check, force, progress)
+		}
+		return index.Ensure(dir, "", force, progress)
+	}
 	draw := func() error { return withBuildProgress(build) }
 	if quiet {
 		// The live display paints the same progress the sink above is
@@ -665,20 +714,7 @@ func cmdIndex(dir string, rest []string) error {
 	// A store deja could not read loses its sessions from recall, and the index
 	// run is where someone is looking at the counts — doctor knowing about it
 	// is not the same as saying it here (#818).
-	for _, h := range sortedHarnesses(index.IngestHealth(dir)) {
-		e := index.IngestHealth(dir)[h]
-		if e.FailedFiles == 0 {
-			continue
-		}
-		// "deja: deja: 1 path could not be read" is the notes file, and reads
-		// like a stutter. It is the user's own writing, so it says so (#901).
-		name := h
-		if h == "deja" {
-			name = "your notes"
-		}
-		fmt.Fprintf(os.Stderr, "deja: %s: %d path%s could not be read — `deja doctor` names %s\n",
-			name, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
-	}
+	unread := sayUnreadable(dir)
 	// An exclusion applies at ingest, so it covers nothing already indexed —
 	// and the sequence someone actually performs is to set the pattern, run
 	// this command, and sync. That used to return silently having applied
@@ -692,8 +728,10 @@ func cmdIndex(dir string, rest []string) error {
 		fmt.Fprintf(said, "deja: %d transcript%s held no message deja could index — not counted as %s\n",
 			n, pluralS(n), pluralSessionWord(n))
 	}
+	// Said on every pass that reads a shared id's copies again, so it is a
+	// count like the ones above and --quiet keeps it out.
 	if n := index.ReportCollisions(); n > 0 {
-		fmt.Fprintf(os.Stderr, "deja: %d session%s %s an id with another transcript — each pair is filed under one project, the one whose file sorts first\n", n, pluralS(n), verbShare(n))
+		fmt.Fprintf(said, "deja: %d session%s %s an id with another transcript — each pair is filed under one project, the one whose file sorts first\n", n, pluralS(n), verbShare(n))
 	}
 	// The per-harness lines above count transcripts, so once any of them
 	// merged, those lines add up to more than the index holds — and the
@@ -737,7 +775,54 @@ func cmdIndex(dir string, rest []string) error {
 	if b := index.LastBuild; !b.Initial && b.Messages > 0 && logoWanted(os.Stdout) && os.Getenv("DEJA_WARMUP_SENTINEL") == "" {
 		fmt.Fprintf(said, "deja: indexed %d session%s, %d message%s%s\n", b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages), tookSuffix(b.Took))
 	}
+	return partialIndex(unread, index.SkippedThisRun()-skippedBefore)
+}
+
+// exitPartial is the status of a `deja index` that wrote the index but left
+// part of the input unread: a path it could not read, or lines it skipped in
+// what it read this run. A cron job or a timer could not tell that from a
+// clean run, because both exited 0 (#5396). 1 stays "the index was not
+// written"; 2 is left alone, since a hook host reads it as "block".
+const exitPartial = 3
+
+// exitStatus is an error that has already been said and carries the status
+// the process exits with.
+type exitStatus int
+
+func (e exitStatus) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+
+// partialIndex is the outcome of an index run that wrote the index: nil, or
+// exitPartial when something it was given was not read.
+func partialIndex(unreadable, skipped int) error {
+	if unreadable > 0 || skipped > 0 {
+		return exitStatus(exitPartial)
+	}
 	return nil
+}
+
+// sayUnreadable names, per store, the paths the index could not read. A store
+// deja could not read loses its sessions from recall, and the index run is
+// where someone is looking at the counts — doctor knowing about it is not the
+// same as saying it here (#818). Returns how many there were.
+func sayUnreadable(dir string) int {
+	health := index.IngestHealth(dir)
+	total := 0
+	for _, h := range sortedHarnesses(health) {
+		e := health[h]
+		if e.FailedFiles == 0 {
+			continue
+		}
+		total += e.FailedFiles
+		// "deja: deja: 1 path could not be read" is the notes file, and reads
+		// like a stutter. It is the user's own writing, so it says so (#901).
+		name := h
+		if h == "deja" {
+			name = "your notes"
+		}
+		fmt.Fprintf(os.Stderr, "deja: %s: %d path%s could not be read — `deja doctor` names %s\n",
+			name, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
+	}
+	return total
 }
 
 func cmdHookContext(dir string, rest []string) error {
@@ -972,6 +1057,9 @@ func printSpawnEdges(w io.Writer, dir string, s model.Session) {
 			by = " as " + s.Agent
 		}
 		fmt.Fprintf(w, "deja: spawned from %s%s — `deja show %s`\n", digest.Short(s.Parent), by, pasteSafe(digest.Short(s.Parent)))
+	} else if s.Kind != "" && strings.HasPrefix(s.Project, "imported:") {
+		// The parent is on the machine that sent it.
+		fmt.Fprintf(w, "deja: %s session from another machine\n", s.Kind)
 	} else if s.Kind != "" {
 		// A kind with no parent is all the harness recorded; saying which
 		// session asked for it would be a guess.
@@ -1118,6 +1206,11 @@ func ctxFromIDPrefix(dir, q string) (bool, error) {
 		fmt.Fprintln(os.Stdout, line)
 	}
 	cw := &countingWriter{w: os.Stdout}
+	// The digest marks its own cuts; a message the index stored short is a
+	// cut made before it, and `deja show` says so the same way (#5392).
+	if line := clippedMessageNote(dir, s); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
 	search.PrintContextStyled(cw, s, "", search.ColorOK(os.Stdout), printableWidth(os.Stdout))
 	if blk := changesBlock(s, search.ContextBudget-cw.n); blk != "" {
 		fmt.Fprint(os.Stdout, "\n"+blk)
@@ -1206,7 +1299,7 @@ func cmdCtx(dir string, rest []string) error {
 		// Both tiers below build their own hits and never went through the cap
 		// in RunDetailed, so `--limit 3` printed the whole window — fifty
 		// sessions — and so did a query with no flag (#3345).
-		hits, _ = capTierHits(search.ErrorHits(ss), o)
+		hits, _ = capTierHits(search.ErrorHits(ss, o.Query), o)
 	} else if result.Tier == search.TierRelevance {
 		o.Strict = result.Strict
 		fmt.Fprintln(os.Stderr, relevanceLead(result.Strict))
@@ -1260,6 +1353,9 @@ func cmdCtx(dir string, rest []string) error {
 		whole = full
 	}
 	cw := &countingWriter{w: os.Stdout}
+	if line := clippedMessageNote(dir, whole); line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
 	search.PrintContextStyled(cw, whole, q, search.ColorOK(os.Stdout), printableWidth(os.Stdout))
 	if blk := changesBlock(whole, search.ContextBudget-cw.n); blk != "" {
 		fmt.Fprint(os.Stdout, "\n"+blk)
@@ -1565,13 +1661,18 @@ func cmdSearch(dir string, rest []string, sourceInstance string) error {
 // `--rebuild` still waits: someone who asked for the rebuild wants its result.
 func ensureForCLISearch(dir string, o search.Options, force bool, progress io.Writer) error {
 	if force {
+		// Asked for by hand, so it builds with automatic indexing off too.
+		defer index.AllowBuild()()
 		return index.EnsureForSearch(dir, o, true, progress)
 	}
-	stale, err := index.EnsureForSearchStale(dir, o, progress)
+	cov, err := index.EnsureForSearchCoverage(dir, o, progress)
 	if err != nil {
 		return err
 	}
-	if stale {
+	if line := manualIndexLine(dir); line != "" && progress != io.Discard {
+		saidManualIndex.Do(func() { fmt.Fprintln(progress, line) })
+	}
+	if cov.Stale {
 		requestWarmup(dir)
 		// Only when there is an index to answer from. On a first build there is
 		// not, and the two lines contradicted each other on the worst run to
@@ -1579,7 +1680,7 @@ func ensureForCLISearch(dir string, o search.Options, force bool, progress io.Wr
 		// from the index as it was" and then "the index is being rebuilt right
 		// now, run this again in a moment" (#3574).
 		if index.ReadableSnapshot(dir) {
-			fmt.Fprintln(progress, "deja: answering from the index as it was — refreshing in the background")
+			fmt.Fprintln(progress, "deja: "+coverageLine(cov))
 		}
 	}
 	return nil
@@ -1659,14 +1760,25 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		fmt.Fprintf(os.Stderr, "deja: answering from the index as it was — %v\n", ensureError(dir, err))
 	}
 	maybeFirstIndexGreeting(dir)
+	// The page is all a capped search shows, so retrieval may rank a large
+	// match from the postings first and read only what can reach it (#5467).
+	if !o.All {
+		o.Window = o.Limit
+		if o.Window <= 0 {
+			o.Window = search.DefaultLimit
+		}
+		o.Activation = policy.ActivationSearch
+	}
 	result, err := index.SearchWithRecoveryDetailed(dir, o, os.Stderr)
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}
+	o.Unread = result.Unread
 	// Before ranking, not after: the cap is applied while ranking, so a rule
 	// that runs later still lets denied sessions occupy the result slots and
 	// the allowed ones never reach the page (#1060).
 	ss, policyHidden := policyFilterSessionsCounted(policy.ActivationSearch, search.WithoutIgnored(result.Sessions))
+	policyHidden += unreadWithheld(result)
 	o.PolicyWithheld = policyHidden
 	o.Tier = result.Tier
 	if result.Neighbour {
@@ -1686,6 +1798,13 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		o.FuzzyVariants = result.Variants
 	}
 	var hits []search.Hit
+	// The relevance and error tiers hand back a ranked window, not the
+	// whole match: date order over them is the newest of that window, and
+	// tierWindow says the match ran past it.
+	tierWindow, windowRead := false, 0
+	// --all reads newest first unless --sort relevance says otherwise; --json
+	// keeps the ranked order a script may rely on unless --sort date asks.
+	dated := o.Sort == search.SortDate || o.All && !o.JSON && o.Sort == ""
 	switch result.Tier {
 	case search.TierError:
 		// A pasted error IS a match; ErrorHits keeps the ranking and the error
@@ -1693,8 +1812,9 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		// zero it out — the word ladder already failed, which is why this tier
 		// fired at all.
 		fmt.Fprintln(os.Stderr, "deja: matched by error signature; showing the sessions that hit it")
-		hits = search.ErrorHits(ss)
+		hits = search.ErrorHits(ss, o.Query)
 		o.Total, o.Capped = result.Total, result.Capped
+		tierWindow = result.Capped
 		errAt := len(hits)
 		hits = dropCopiedHits(dir, hits)
 		if d := errAt - len(hits); o.Total >= d {
@@ -1703,12 +1823,20 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		if o.Total < len(hits) {
 			o.Total = len(hits)
 		}
+		if o.Sort == search.SortDate {
+			search.ByDate(hits)
+			windowRead = len(hits)
+		}
 		var capped bool
 		hits, capped = capTierHits(hits, o)
 		o.Capped = o.Capped || capped
 	case search.TierRelevance:
 		o.Strict = result.Strict
-		fmt.Fprintln(os.Stderr, relevanceLead(result.Strict))
+		lead := relevanceLead(result.Strict)
+		if dated && result.Strict > 0 {
+			lead = strings.Replace(lead, "the rest below are ranked by relevance", "they come first and the rest after, each newest first", 1)
+		}
+		fmt.Fprintln(os.Stderr, lead)
 		hits = markStrictHits(search.RelevanceHitsWeighted(ss, index.RelevanceMatchTerms(o.Query), result.TermIDF), result)
 		relAt := len(hits)
 		hits = dropCopiedHits(dir, hits)
@@ -1728,6 +1856,11 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		if o.Total < len(hits) {
 			o.Total = len(hits)
 		}
+		tierWindow = result.Capped
+		if o.Sort == search.SortDate {
+			search.ByDate(hits)
+			windowRead = len(hits)
+		}
 		var relCapped bool
 		hits, relCapped = capTierHits(hits, o)
 		o.Capped = o.Capped || relCapped
@@ -1737,7 +1870,22 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		// list the cap has already trimmed.
 		// Copies go before the cap: a fork repeating its source took a slot
 		// and counted in the total (#5320, #5335).
-		detailed, rerr := search.RunDetailedKeeping(ss, o, func(hs []search.Hit) []search.Hit { return dropCopiedHits(dir, hs) })
+		keep := func(hs []search.Hit) []search.Hit { return dropCopiedHits(dir, hs) }
+		detailed, rerr := search.RunDetailedKeeping(ss, o, keep)
+		// A date page drawn from the newest matches by their postings comes
+		// back short when few of them say a quoted phrase and the rest were
+		// too many to check. It is read whole then, as the screen does.
+		if rerr == nil && o.Sort == search.SortDate && o.Window > 0 && len(detailed.Hits) < o.Window && detailed.Total > len(detailed.Hits) {
+			whole := o
+			whole.Window, whole.Unread = 0, nil
+			if r2, err2 := index.SearchWithRecoveryDetailed(dir, whole, io.Discard); err2 == nil && r2.Tier == result.Tier {
+				ss2, _ := policyFilterSessionsCounted(policy.ActivationSearch, search.WithoutIgnored(r2.Sessions))
+				whole.Unread = r2.Unread
+				if d2, e2 := search.RunDetailedKeeping(ss2, whole, keep); e2 == nil {
+					detailed, o.Unread = d2, r2.Unread
+				}
+			}
+		}
 		if rerr != nil {
 			// "run:" is the name of a function, and the reader of this line is
 			// someone who mistyped a pattern (#2286). The only error that
@@ -1748,9 +1896,10 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 			}
 			return rerr
 		}
-		hits, o.Total, o.Capped = detailed.Hits, detailed.Total, detailed.Capped
+		hits, o.Total, o.Capped, o.TotalEstimated = detailed.Hits, detailed.Total, detailed.Capped, detailed.Estimated
 	}
-	if !o.NoEmbed && os.Getenv("DEJA_EMBED") != "off" {
+	// A rerank reorders by meaning, which date order throws away again.
+	if !o.NoEmbed && os.Getenv("DEJA_EMBED") != "off" && o.Sort != search.SortDate {
 		hits = maybeRerank(dir, hits, o, os.Stderr)
 	}
 	var semantic bool
@@ -1776,7 +1925,7 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 	demoted := demoteRejected(hits)
 	attachMoved(hits)
 	if !o.Capped {
-		o.Total = len(hits)
+		o.Total, o.TotalEstimated = len(hits), false
 	}
 	if note := demotedNote(hits, demoted); note != "" {
 		fmt.Fprintf(os.Stderr, "deja: %s\n", note)
@@ -1820,10 +1969,14 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		// an explicit --limit, or by the relevance tier's own retrieval window,
 		// and neither of those lifts with the flag they are being sent to
 		// (#1608). Say what is shown and leave the advice out.
+		total := fmt.Sprint(o.Total)
+		if o.TotalEstimated {
+			total = "about " + total
+		}
 		if o.All {
-			fmt.Fprintf(os.Stderr, "deja: showing %d of %d\n", len(hits), o.Total)
+			fmt.Fprintf(os.Stderr, "deja: showing %d of %s\n", len(hits), total)
 		} else {
-			fmt.Fprintf(os.Stderr, "deja: showing %d of %d — add --all to see the rest\n", len(hits), o.Total)
+			fmt.Fprintf(os.Stderr, "deja: showing %d of %s — add --all to see the rest\n", len(hits), total)
 		}
 	}
 	// The answer can also be short for a reason no flag lifts. Counted over the
@@ -1845,16 +1998,15 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 	o.Width = printableWidth(os.Stdout)
 	// --all is the whole list, and past the first screen the scores are near
 	// ties a reader cannot see, so the order read as random: Jun 2, May 13,
-	// Mar 4, then Jun 22 (#45). The whole list reads newest first; --json keeps
-	// the ranked order a script may rely on.
-	if o.All && !o.JSON && len(hits) > 1 {
-		sort.SliceStable(hits, func(i, j int) bool { return hits[i].Session.Updated.After(hits[j].Session.Updated) })
-		// Under --limit the list is the top of the ranking, and "all 5
-		// matches" sat under "showing 5 of 40".
-		if o.Total > len(hits) {
-			fmt.Fprintln(os.Stderr, "deja: newest first")
-		} else {
-			fmt.Fprintf(os.Stderr, "deja: all %d matches, newest first\n", len(hits))
+	// Mar 4, then Jun 22 (#45). The whole list reads newest first unless
+	// --sort relevance says otherwise; --json keeps the ranked order a script
+	// may rely on unless --sort date asks for this one (#5577).
+	if dated {
+		// The semantic tier and the demotion of rejected sessions reorder
+		// after retrieval; the date is the last word.
+		search.ByDate(hits)
+		if !o.JSON && len(hits) > 1 {
+			fmt.Fprintln(os.Stderr, "deja: "+newestFirstNote(o, len(hits), tierWindow, windowRead))
 		}
 	}
 	// Through a counter, so the log records what actually went out rather than
@@ -2164,11 +2316,11 @@ func printNoMatchesHinted(w io.Writer, dir, q string, regex, hinted bool) (misty
 		}
 		return
 	} else if ok {
-		fmt.Fprint(w, fitNotice(w, fmt.Sprintf("deja: no matches in %d indexed session%s — try fewer words or --re (query %q)\n", reach, pluralS(reach), q)))
+		fmt.Fprint(w, fitNotice(w, fmt.Sprintf("deja: no matches in %d indexed session%s — %s (query %q)\n", reach, pluralS(reach), missAdvice(q, regex), q)))
 	} else if n, err := index.SessionCount(dir); err == nil {
-		fmt.Fprint(w, fitNotice(w, fmt.Sprintf("deja: no matches in %d indexed session%s — try fewer words or --re (query %q)\n", n, pluralS(n), q)))
+		fmt.Fprint(w, fitNotice(w, fmt.Sprintf("deja: no matches in %d indexed session%s — %s (query %q)\n", n, pluralS(n), missAdvice(q, regex), q)))
 	} else {
-		fmt.Fprintf(w, "deja: no matches — try fewer words or --re (query %q)\n", q)
+		fmt.Fprintf(w, "deja: no matches — %s (query %q)\n", missAdvice(q, regex), q)
 	}
 	// Before advising fewer words: the sessions that hold every one of them may
 	// exist and be covered by the ignore rule, in which case rewording is the
@@ -2177,8 +2329,10 @@ func printNoMatchesHinted(w io.Writer, dir, q string, regex, hinted bool) (misty
 		fmt.Fprint(w, note)
 	}
 	// Which word to drop is the reader's next question, and deja read the
-	// per-term counts to decide there was no intersection (#826).
-	if line := termCountLine(dir, q); line != "" {
+	// per-term counts to decide there was no intersection (#826). Not for a
+	// pattern: its words are not looked up together, so "no session has them
+	// together" is not why it missed.
+	if line := termCountLine(dir, q); line != "" && !regex {
 		fmt.Fprint(w, line)
 	}
 	// The first thing anyone types is a guess at a command name, and a wrong
@@ -2199,6 +2353,34 @@ func printNoMatchesHinted(w io.Writer, dir, q string, regex, hinted bool) (misty
 		fmt.Fprint(w, note)
 	}
 	return mistypedCommand
+}
+
+// missAdvice is what to try after a miss. "Try --re" said to someone who used
+// it is advice they already followed; a pattern misses for its own reasons —
+// an anchor, since ^ and $ hold at each line, or being stricter than the text.
+func missAdvice(q string, regex bool) string {
+	if !regex {
+		return "try fewer words or --re"
+	}
+	if re, err := syntax.Parse(q, syntax.Perl); err == nil && hasAnchor(re) {
+		return "try the pattern without ^ or $, a looser one, or plain words without --re"
+	}
+	return "try a looser pattern, or plain words without --re"
+}
+
+// hasAnchor reports a ^ or $ in a parsed pattern; one inside a class or
+// escaped is a character, not an anchor.
+func hasAnchor(re *syntax.Regexp) bool {
+	switch re.Op {
+	case syntax.OpBeginLine, syntax.OpEndLine, syntax.OpBeginText, syntax.OpEndText:
+		return true
+	}
+	for _, sub := range re.Sub {
+		if hasAnchor(sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // roleServedHint names the answer deja is holding but ranking will never
@@ -2345,11 +2527,20 @@ func hiddenByOwnSettings() string {
 	// both "project patterns" told someone who had excluded their only store
 	// that a project of theirs was hidden.
 	stores := sources.ExcludedHarnesses()
-	if n := len(sources.ExclusionPatterns()) - len(stores); n > 0 {
+	if n := projectExcludePatterns(); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d project pattern%s excluded from indexing (%s)", n, pluralS(n), sources.ExcludePath()))
 	}
 	if n := len(stores); n > 0 {
-		parts = append(parts, fmt.Sprintf("%d store%s not read at all (%s)", n, pluralS(n), sources.ExcludePath()))
+		settings := map[string]bool{}
+		for name := range stores {
+			settings[harnessExclusionSource(name)] = true
+		}
+		var names []string
+		for name := range settings {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		parts = append(parts, fmt.Sprintf("%d store%s not read at all (%s)", n, pluralS(n), strings.Join(names, ", ")))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -2858,16 +3049,24 @@ func findByPrefixHarness(dir, p, harness string) (model.Session, bool, error) {
 func ensureForCLIRead(dir string) error {
 	busy, err := index.EnsureUnlessBusy(dir, os.Stderr)
 	answeredFromSnapshot.Store(busy)
+	if line := manualIndexLine(dir); err == nil && line != "" {
+		saidManualIndex.Do(func() { fmt.Fprintln(os.Stderr, line) })
+	}
 	if busy {
 		requestWarmup(dir)
 		saidReadingAsItWas.Do(func() {
-			fmt.Fprintln(os.Stderr, "deja: answering from the index as it was — refreshing in the background")
+			c := index.SnapshotCoverage(dir)
+			c.Stale = true
+			fmt.Fprintln(os.Stderr, "deja: "+coverageLine(c))
 		})
 	}
 	return err
 }
 
 var saidReadingAsItWas sync.Once
+
+// saidManualIndex keeps the index-date line to one per command.
+var saidManualIndex sync.Once
 
 // answeredFromSnapshot is whether the last ensureForCLIRead skipped the update
 // because another deja held the lock.
@@ -3082,7 +3281,7 @@ func parseSearch(args []string) (search.Options, error) {
 			o.All = true
 		case "--no-embed":
 			o.NoEmbed = true
-		case "--harness", "--project", "--since", "--role", "--limit", "--session":
+		case "--harness", "--project", "--since", "--role", "--limit", "--session", "--sort":
 			if i+1 >= len(args) {
 				return o, fmt.Errorf("%s needs value", a)
 			}
@@ -3105,6 +3304,15 @@ func parseSearch(args []string) (search.Options, error) {
 				o.Role = v
 			case "--session":
 				o.Session = v
+			case "--sort":
+				switch strings.ToLower(v) {
+				case search.SortDate, "newest":
+					o.Sort = search.SortDate
+				case search.SortRelevance:
+					o.Sort = search.SortRelevance
+				default:
+					return o, fmt.Errorf("--sort takes date or relevance, not %q", v)
+				}
 			case "--limit":
 				n, err := strconv.Atoi(v)
 				if err != nil || n < 1 || n > 100 {
@@ -3123,7 +3331,7 @@ func parseSearch(args []string) (search.Options, error) {
 			// "--retry budget"` is a real search. A token one edit away from a
 			// real flag is not: folding `--limti` into the query turned a
 			// working search into "you have no such memory" (#755).
-			if nearestKnownFlag(a, searchFlags) != "" {
+			if nearestSearchFlag(a) != "" {
 				return o, unknownFlag("search", a, searchFlags)
 			}
 			// A flag deja takes elsewhere is not a typo and is nowhere near a
@@ -3232,16 +3440,29 @@ var (
 
 var searchFlags = []string{
 	"--json", "--re", "--all", "--no-embed", "--rebuild",
-	"--harness", "--project", "--since", "--role", "--limit", "--session",
+	"--harness", "--project", "--since", "--role", "--limit", "--session", "--sort",
 }
 
 // nearestSearchFlag names the search flag a token was probably meant to be.
 // The rule it introduced is now every command's, in nearestKnownFlag; this is
 // the search-shaped name for it, kept because search is the one command where
 // the answer also decides whether a dashed token is a query term.
+//
+// --sort is left out of the near misses: --soft, --port and --short are one
+// edit from it and are things people search for (`git reset --soft`).
 func nearestSearchFlag(a string) string {
-	return nearestKnownFlag(a, searchFlags)
+	return nearestKnownFlag(a, searchNearMissFlags)
 }
+
+var searchNearMissFlags = func() []string {
+	var out []string
+	for _, f := range searchFlags {
+		if f != "--sort" {
+			out = append(out, f)
+		}
+	}
+	return out
+}()
 
 // blameMode is what the caller asked for beyond the hits: the line answer on
 // its own (`--attribution`), as JSON, and whether to record it in
@@ -3738,12 +3959,56 @@ func commonDir(paths []string) string {
 	return dir
 }
 
-// projectExcludePatterns is how many lines in the exclude file are project
-// patterns. A `harness:` line lives in the same file and is not one, so
-// counting them together reported "excluded-patterns=1" against every store on
-// a machine whose only rule was "never read this one" (#3499).
+// projectExcludePatterns counts project rules from the file and environment.
+// Count them directly: excluded stores can also come from the environment,
+// and duplicate harness rules do not each add a store (#5401).
 func projectExcludePatterns() int {
-	return len(sources.ExclusionPatterns()) - len(sources.ExcludedHarnesses())
+	n := 0
+	for _, pattern := range sources.ExclusionPatterns() {
+		if !strings.HasPrefix(pattern, "harness:") {
+			n++
+		}
+	}
+	return n
+}
+
+// An environment exclusion must not be attributed to the exclude file.
+// Prefer the environment when both settings exclude the same store.
+func harnessExclusionSource(name string) string {
+	for _, excluded := range strings.Split(os.Getenv("DEJA_EXCLUDE_HARNESSES"), ",") {
+		if strings.EqualFold(strings.TrimSpace(excluded), name) {
+			return "DEJA_EXCLUDE_HARNESSES"
+		}
+	}
+	return sources.ExcludePath()
+}
+
+// harnessExclusionSources names where a set of store exclusions come from:
+// the exclude file, DEJA_EXCLUDE_HARNESSES, or both.
+func harnessExclusionSources(names map[string]bool) string {
+	env, file := false, false
+	for name := range names {
+		if harnessExclusionSource(name) == "DEJA_EXCLUDE_HARNESSES" {
+			env = true
+		} else {
+			file = true
+		}
+	}
+	switch {
+	case env && file:
+		return reportPath(sources.ExcludePath()) + " and DEJA_EXCLUDE_HARNESSES"
+	case env:
+		return "DEJA_EXCLUDE_HARNESSES"
+	}
+	return reportPath(sources.ExcludePath())
+}
+
+func harnessExclusionReason(name string) string {
+	setting := harnessExclusionSource(name)
+	if setting == "DEJA_EXCLUDE_HARNESSES" {
+		return "excluded — " + setting
+	}
+	return fmt.Sprintf("excluded — `harness:%s` is in %s", name, setting)
 }
 
 func printSources(dir string) {
@@ -3855,8 +4120,7 @@ func printSourcesTo(w io.Writer, dir string) {
 		// just been told never to open, which is the opposite of what this
 		// screen is for (#3499).
 		if skipStore[it.name] {
-			fmt.Fprintf(w, "%s\t%s\texcluded — `harness:%s` is in %s\n",
-				it.name, it.location, it.name, sources.ExcludePath())
+			fmt.Fprintf(w, "%s\t%s\t%s\n", it.name, it.location, harnessExclusionReason(it.name))
 			continue
 		}
 		redacted := 0
@@ -3921,8 +4185,7 @@ func printSourcesTo(w io.Writer, dir string) {
 		if !skipStore[name] {
 			return false
 		}
-		fmt.Fprintf(w, "%s\t%s\texcluded — `harness:%s` is in %s\n",
-			name, location, name, sources.ExcludePath())
+		fmt.Fprintf(w, "%s\t%s\t%s\n", name, location, harnessExclusionReason(name))
 		return true
 	}
 	aiderFiles := sources.AiderFiles()
@@ -4041,7 +4304,7 @@ func orphanedTombstones(dir string, keys []string) map[string]bool {
 			return seen, seen != nil
 		}
 		var found map[string]bool
-		for _, h := range sources.Registry() {
+		for _, h := range sources.StoresToRead() {
 			if h.Name != harness || h.Load == nil {
 				continue
 			}
@@ -5052,6 +5315,10 @@ func ensureError(dir string, err error) error {
 	if dir == "" {
 		dir = index.DefaultDir()
 	}
+	// Worded for the reader already, command included (#5385).
+	if index.IsManualStop(err) {
+		return err
+	}
 	if errors.Is(err, fs.ErrPermission) {
 		// An ejected volume takes its mount point with it, and creating that
 		// point back fails with EPERM on macOS — so the errno says permissions
@@ -5153,7 +5420,7 @@ func indexLooksUnmounted(dir string) (string, bool) {
 // legitimately contain one.
 var searchValueFlags = map[string]bool{
 	"--harness": true, "--project": true, "--since": true,
-	"--role": true, "--limit": true,
+	"--role": true, "--limit": true, "--session": true, "--sort": true,
 }
 
 func splitEqualsForms(args []string) []string {
@@ -5610,4 +5877,20 @@ func capTierHits(hits []search.Hit, o search.Options) ([]search.Hit, bool) {
 	// same two flags mean opposite things depending on which tier answered
 	// (review of #3345).
 	return search.CapHits(hits, o.Limit, false)
+}
+
+// newestFirstNote is the line above a date-ordered answer. The exact tiers
+// read the newest of the whole match, so the line says only the order; the
+// relevance and error tiers rank a window first, and the newest of that
+// window is not the newest of the match when it ran past it.
+func newestFirstNote(o search.Options, shown int, tierWindow bool, window int) string {
+	switch {
+	case tierWindow && window > 0:
+		return fmt.Sprintf("newest first among the %d closest of %s", window, grouped(o.Total))
+	case o.Total > shown:
+		// Under --limit the list is the top of the order, and "all 5
+		// matches" sat under "showing 5 of 40".
+		return "newest first"
+	}
+	return fmt.Sprintf("all %d matches, newest first", shown)
 }

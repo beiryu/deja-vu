@@ -193,7 +193,7 @@ func compactionCandidatesForPath(harness, path string) []compactionCandidate {
 // session: first those whose path names the id, which is how most stores file
 // a session, then the most recently written few that hold the id at all.
 func compactionCandidatesByID(harness, id string) []compactionCandidate {
-	for _, h := range Registry() {
+	for _, h := range StoresToRead() {
 		if h.Name != harness || h.Files == nil {
 			continue
 		}
@@ -283,7 +283,7 @@ func compactionSessionWorkspace(harness, path string, s model.Session) string {
 	case "cline":
 		return ClineSessionDir(path)
 	case "trae", "codex":
-		_, cwd, _ := codexRolloutHead(path)
+		_, cwd, _, _ := codexRolloutHead(path)
 		return cwd
 	case "claude":
 		return ClaudeSessionDir(path)

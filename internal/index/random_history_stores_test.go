@@ -27,10 +27,17 @@ type opencodeSession struct {
 type historyStores struct {
 	codexRoot string
 	codex     []*codexRollout
+	// codexLogged is the sessions known from Codex's history.jsonl alone.
+	codexLogged []string
+	codexLines  int
 	// db is empty when there is no sqlite3 to write the store with.
 	db       string
 	opencode []*opencodeSession
-	clock    int64
+	// grokDB is a store whose records name the database, as cursor's and
+	// goose's do; opencode's name the project.
+	grokDB string
+	grok   []*opencodeSession
+	clock  int64
 	// claudeHistory is Claude Code's prompt log.
 	claudeHistory string
 	// forgotten holds session ids forget took out, for unforget to bring back.
@@ -53,6 +60,11 @@ func (r *historyRun) openStores() {
 	if _, err := exec.LookPath("sqlite3"); err == nil {
 		m.db = filepath.Join(r.h.tmp, "opencode.db")
 		t.Setenv("DEJA_OPENCODE_DB", m.db)
+		m.grokDB = filepath.Join(r.h.tmp, "grok.db")
+		t.Setenv("DEJA_GROK_DB", m.grokDB)
+		r.sqlOn(m.grokDB, `CREATE TABLE workspaces (id TEXT PRIMARY KEY, canonical_path TEXT);
+CREATE TABLE sessions (id TEXT PRIMARY KEY, workspace_id TEXT, title TEXT, cwd_last TEXT, created_at TEXT);
+CREATE TABLE messages (session_id TEXT, seq INTEGER, role TEXT, message_json TEXT, created_at TEXT);`)
 		r.sql(`create table session(id text primary key, directory text, title text, time_created integer, time_updated integer);
 create table message(id text primary key, session_id text, time_created integer, time_updated integer, data text);
 create table part(id text primary key, message_id text, session_id text, time_created integer, time_updated integer, data text);`)
@@ -93,7 +105,16 @@ func (r *historyRun) anyStep() {
 			r.step()
 			return
 		}
-		r.opencodeStep()
+		if r.rng.Intn(3) == 0 {
+			r.grokStep()
+		} else {
+			r.opencodeStep()
+		}
+		// A store and a transcript changed in one pass: the pass carries
+		// the store's sessions by key and the transcript's by path (#5476).
+		if r.rng.Intn(2) == 0 {
+			r.step()
+		}
 	case n < 18:
 		r.privacyStep()
 	default:
@@ -162,11 +183,13 @@ func (r *historyRun) codexStep() {
 	if len(m.codex) > 0 {
 		c = m.codex[r.rng.Intn(len(m.codex))]
 	}
-	op := r.rng.Intn(6)
-	if c == nil {
+	op := r.rng.Intn(9)
+	if c == nil && op < 6 {
 		op = 0
 	}
 	switch op {
+	case 6, 7, 8:
+		r.codexHistoryStep(op)
 	case 0:
 		r.next++
 		c = &codexRollout{id: fmt.Sprintf("cx%d", r.next), day: 1 + r.rng.Intn(20)}
@@ -212,6 +235,71 @@ func (r *historyRun) codexStep() {
 	}
 }
 
+// codexHistoryStep writes Codex's prompt log: prompts of sessions known from
+// the log alone, often in the same pass as another one's rollout landing, so
+// the log is read by the replacement path; or the log trimmed from the front
+// the way Codex keeps it under max_bytes (#5403).
+func (r *historyRun) codexHistoryStep(op int) {
+	m := &r.more
+	hist := filepath.Join(m.codexRoot, "history.jsonl")
+	if op == 8 && fileExists(hist) {
+		b, err := os.ReadFile(hist)
+		if err != nil {
+			r.t.Fatal(err)
+		}
+		lines := strings.SplitAfter(string(b), "\n")
+		cut := 1 + r.rng.Intn(len(lines))
+		writeHistoryFile(r, hist, strings.Join(lines[min(cut, len(lines)):], ""), false)
+		r.log = append(r.log, fmt.Sprintf("codex history trimmed by %d lines", cut))
+		return
+	}
+	var did []string
+	for n := 1 + r.rng.Intn(3); n > 0; n-- {
+		var id string
+		// Codex logs the prompts of sessions with a rollout too.
+		var withRollout []string
+		for _, c := range m.codex {
+			if len(c.id) == 36 {
+				withRollout = append(withRollout, c.id)
+			}
+		}
+		if len(withRollout) > 0 && r.rng.Intn(4) == 0 {
+			id = withRollout[r.rng.Intn(len(withRollout))]
+		} else if len(m.codexLogged) < 3 || r.rng.Intn(3) == 0 {
+			r.next++
+			id = fmt.Sprintf("019a0000-0000-7000-8000-%012d", r.next)
+			m.codexLogged = append(m.codexLogged, id)
+		} else {
+			id = m.codexLogged[r.rng.Intn(len(m.codexLogged))]
+		}
+		m.codexLines++
+		at := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC).Add(time.Duration(m.codexLines) * time.Minute)
+		writeHistoryFile(r, hist, hjson(map[string]any{"session_id": id, "ts": at.Unix(), "text": r.prompt(3)}), fileExists(hist))
+		did = append(did, "a codex history prompt for "+id)
+	}
+	if op == 7 && len(m.codexLogged) > 1 {
+		i := r.rng.Intn(len(m.codexLogged))
+		id := m.codexLogged[i]
+		m.codexLogged = append(m.codexLogged[:i], m.codexLogged[i+1:]...)
+		c := &codexRollout{id: id, day: 1 + r.rng.Intn(20)}
+		body := codexLine(c.at(), "session_meta", map[string]any{"id": c.id, "cwd": "/w/app"})
+		// Now and then the rollout holds no message yet: the session leaves
+		// the history parse with nothing to take its place.
+		if r.rng.Intn(3) > 0 {
+			body += r.codexTurns(c)
+		}
+		writeHistoryFile(r, r.codexPath(c), body, false)
+		m.codex = append(m.codex, c)
+		did = append(did, "the rollout of logged "+id+" lands")
+	}
+	r.log = append(r.log, strings.Join(did, ", "))
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
 func writeHistoryFile(r *historyRun, p, body string, appendTo bool) {
 	r.t.Helper()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -233,13 +321,45 @@ func writeHistoryFile(r *historyRun, p, body string, appendTo bool) {
 
 func (r *historyRun) sql(stmts string) {
 	r.t.Helper()
-	if out, err := exec.Command("sqlite3", r.more.db, stmts).CombinedOutput(); err != nil {
+	r.sqlOn(r.more.db, stmts)
+}
+
+func (r *historyRun) sqlOn(db, stmts string) {
+	r.t.Helper()
+	if out, err := exec.Command("sqlite3", db, stmts).CombinedOutput(); err != nil {
 		r.t.Fatalf("sqlite3: %v %s", err, out)
 	}
 	// The store is noticed by its mtime, and two writes in one second would
 	// otherwise look like none.
 	at := time.Now().Add(time.Duration(len(r.log)+1) * time.Second)
-	_ = os.Chtimes(r.more.db, at, at)
+	_ = os.Chtimes(db, at, at)
+}
+
+// grokStep starts a grok session or adds turns to one, at the store's clock.
+func (r *historyRun) grokStep() {
+	m := &r.more
+	m.clock = max(m.clock+1000, time.Now().UnixMilli())
+	turn := func(s *opencodeSession) string {
+		s.msgs++
+		role, msg := "user", `{"content":"why does the `+r.words(4)+` fail"}`
+		if s.msgs%2 == 0 {
+			role, msg = "assistant", `{"content":[{"type":"text","text":"The `+r.words(5)+` needs a fix."}]}`
+		}
+		at := time.UnixMilli(m.clock + int64(s.msgs)).UTC().Format("2006-01-02T15:04:05.000Z")
+		return fmt.Sprintf("INSERT INTO messages VALUES ('%s',%d,'%s','%s','%s');\n", s.id, s.msgs, role, msg, at)
+	}
+	if len(m.grok) == 0 || r.rng.Intn(3) == 0 {
+		r.next++
+		s := &opencodeSession{id: fmt.Sprintf("gk%d", r.next)}
+		at := time.UnixMilli(m.clock).UTC().Format("2006-01-02T15:04:05.000Z")
+		r.sqlOn(m.grokDB, fmt.Sprintf("INSERT INTO sessions VALUES ('%s','w','start: %s','/w/%s','%s');\n", s.id, r.words(3), historyProjects[r.rng.Intn(len(historyProjects))], at)+turn(s))
+		m.grok = append(m.grok, s)
+		r.log = append(r.log, "new grok "+s.id)
+		return
+	}
+	s := m.grok[r.rng.Intn(len(m.grok))]
+	r.sqlOn(m.grokDB, turn(s)+turn(s))
+	r.log = append(r.log, "grow grok "+s.id)
 }
 
 // opencodeMessage adds one message with one text part, at the store's clock.
@@ -319,6 +439,7 @@ func (r *historyRun) privacyStep() {
 	for _, c := range m.codex {
 		ids = append(ids, c.id)
 	}
+	ids = append(ids, m.codexLogged...)
 	for _, s := range m.opencode {
 		ids = append(ids, s.id)
 	}

@@ -226,6 +226,15 @@ func cutEntry(text string, cut [2]int) string {
 	if i >= 0 && blank[i] == ',' {
 		return out[:i] + out[i+1:]
 	}
+	k := cut[1]
+	for k < len(blank) && (blank[k] == ' ' || blank[k] == '\t' || blank[k] == '\n' || blank[k] == '\r') {
+		k++
+	}
+	if k < len(blank) && blank[k] == ',' {
+		cutLen := cut[1] - cut[0]
+		pos := k - cutLen
+		return out[:pos] + out[pos+1:]
+	}
 	return out
 }
 
@@ -578,7 +587,11 @@ func jsoncRemoveKey(text, blockKey, key string, dropFrom int) (string, error) {
 	if open < 0 {
 		return text, nil
 	}
-	keys := splitBlockKey(blockKey)
+	// An empty blockKey is the top-level object, for a key that lives there.
+	var keys []string
+	if blockKey != "" {
+		keys = splitBlockKey(blockKey)
+	}
 	if dropFrom < len(keys) {
 		chain, have := walkJSONCKeys(text, open, keys[:dropFrom+1])
 		if chain == nil || have <= dropFrom {
@@ -589,6 +602,13 @@ func jsoncRemoveKey(text, blockKey, key string, dropFrom int) (string, error) {
 		return closeEmptied(cutEntry(text, zedEntrySpan(text, chain)), keys), nil
 	}
 	block, have := walkJSONCKeys(text, open, keys)
+	if len(keys) == 0 {
+		end := zedObjectEnd(text, open)
+		if end < 0 {
+			return text, nil
+		}
+		block = &zedSpan{keyStart: open, valueOpen: open, valueEnd: end}
+	}
 	if block == nil || have < len(keys) {
 		return text, nil
 	}

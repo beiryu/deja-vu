@@ -517,68 +517,74 @@ const ampServerSideNote = "Amp since 2026-03-31 keeps threads on ampcode.com, no
 func doctorStoreChecks() []doctorStoreCheck {
 	aiderPaths := []string{sources.Home()}
 	aiderPaths = append(aiderPaths, filepath.SplitList(os.Getenv("DEJA_AIDER_ROOTS"))...)
-	cursorFiles := append(sources.CursorTranscripts(), sources.CursorDBs()...)
-	checks := []doctorStoreCheck{
-		{"claude", sources.ClaudeRoots(), sources.ClaudeFiles(), parseDoctorClaude},
-		{"codex", sources.CodexRoots(), sources.CodexFiles(), parseDoctorCodex},
-		{"trae", []string{sources.TraeRoot()}, sources.TraeFiles(), parseDoctorTrae},
-		{"opencode", []string{sources.OpencodeDB()}, presentDoctorFile(sources.OpencodeDB()), doctorProbeOpencode},
-		{"aider", aiderPaths, sources.AiderFiles(), sources.ParseAiderFile},
-		{"gemini", []string{sources.GeminiRoot()}, sources.GeminiChatFiles(), sources.ParseGeminiFile},
-		{"cursor", []string{sources.CursorUserRoot(), sources.CursorCLIRoot()}, cursorFiles, parseDoctorCursor},
-		{"antigravity", sources.AntigravityRoots(), sources.AntigravityTranscripts(), sources.ParseAntigravityFile},
-		{"grok", []string{filepath.Join(sources.GrokRoot(), "sessions")}, sources.GrokSessionFiles(), sources.ParseGrokFile},
-		{"hermes", []string{sources.HermesHome(), sources.HermesProfilesRoot()}, sources.HermesSessionFiles(), parseDoctorHermes},
-		{"qwen", []string{filepath.Join(sources.QwenRoot(), "projects")}, sources.QwenSessionFiles(), sources.ParseQwenFile},
-		{"codebuddy", sources.CodeBuddyRoots(), sources.CodeBuddySessionFiles(), sources.ParseCodeBuddyFile},
-		{"kimi", []string{filepath.Join(sources.KimiRoot(), "sessions")}, sources.KimiSessionFiles(), sources.ParseKimiFile},
-		{"goose", sources.GooseSessionsDirs(), sources.GooseSessionFiles(), parseDoctorGoose},
-		{"continue", []string{filepath.Join(sources.ContinueRoot(), "sessions")}, sources.ContinueSessionFiles(), sources.ParseContinueFile},
-		{"crush", []string{sources.CrushDataHome()}, sources.CrushDBs(), sources.ParseCrushDB},
-		{"pi", []string{sources.PiRoot()}, sources.PiSessionFiles(), sources.ParsePiFile},
-		{"omp", []string{sources.OmpRoot()}, sources.OmpSessionFiles(), sources.ParseOmpFile},
-		{"prime", sources.PrimeRoots(), sources.PrimeSessionFiles(), sources.ParsePrimeFile},
-		{"amp", []string{sources.AmpRoot()}, sources.AmpThreadFiles(), sources.ParseAmpFile},
-		{"openclaw", []string{sources.OpenClawRoot()}, sources.OpenClawStoreFiles(), parseDoctorOpenClaw},
-		{"copilot", []string{sources.CopilotRoot()}, sources.CopilotSessionFiles(), sources.ParseCopilotFile},
-		{"copilot-chat", sources.CopilotChatRoots(), sources.CopilotChatSessionFiles(), sources.ParseCopilotChatFile},
+	// The file lists are read only for a store that is read: listing an
+	// excluded one walked it on every `deja index` and doctor (#5394).
+	checks := []struct {
+		name  string
+		paths []string
+		files func() []string
+		parse func(string) ([]model.Session, error)
+	}{
+		{"claude", sources.ClaudeRoots(), sources.ClaudeFiles, parseDoctorClaude},
+		{"codex", sources.CodexRoots(), sources.CodexFiles, parseDoctorCodex},
+		{"trae", []string{sources.TraeRoot()}, sources.TraeFiles, parseDoctorTrae},
+		{"opencode", []string{sources.OpencodeDB()}, func() []string { return presentDoctorFile(sources.OpencodeDB()) }, doctorProbeOpencode},
+		{"aider", aiderPaths, sources.AiderFiles, sources.ParseAiderFile},
+		{"gemini", []string{sources.GeminiRoot()}, sources.GeminiChatFiles, sources.ParseGeminiFile},
+		{"cursor", []string{sources.CursorUserRoot(), sources.CursorCLIRoot()}, func() []string { return append(sources.CursorTranscripts(), sources.CursorDBs()...) }, parseDoctorCursor},
+		{"antigravity", sources.AntigravityRoots(), sources.AntigravityTranscripts, sources.ParseAntigravityFile},
+		{"grok", []string{filepath.Join(sources.GrokRoot(), "sessions")}, sources.GrokSessionFiles, sources.ParseGrokFile},
+		{"hermes", []string{sources.HermesHome(), sources.HermesProfilesRoot()}, sources.HermesSessionFiles, parseDoctorHermes},
+		{"qwen", []string{filepath.Join(sources.QwenRoot(), "projects")}, sources.QwenSessionFiles, sources.ParseQwenFile},
+		{"codebuddy", sources.CodeBuddyRoots(), sources.CodeBuddySessionFiles, sources.ParseCodeBuddyFile},
+		{"kimi", []string{filepath.Join(sources.KimiRoot(), "sessions")}, sources.KimiSessionFiles, sources.ParseKimiFile},
+		{"goose", sources.GooseSessionsDirs(), sources.GooseSessionFiles, parseDoctorGoose},
+		{"continue", []string{filepath.Join(sources.ContinueRoot(), "sessions")}, sources.ContinueSessionFiles, sources.ParseContinueFile},
+		{"crush", []string{sources.CrushDataHome()}, sources.CrushDBs, sources.ParseCrushDB},
+		{"pi", []string{sources.PiRoot()}, sources.PiSessionFiles, sources.ParsePiFile},
+		{"omp", []string{sources.OmpRoot()}, sources.OmpSessionFiles, sources.ParseOmpFile},
+		{"prime", sources.PrimeRoots(), sources.PrimeSessionFiles, sources.ParsePrimeFile},
+		{"amp", []string{sources.AmpRoot()}, sources.AmpThreadFiles, sources.ParseAmpFile},
+		{"openclaw", []string{sources.OpenClawRoot()}, sources.OpenClawStoreFiles, parseDoctorOpenClaw},
+		{"copilot", []string{sources.CopilotRoot()}, sources.CopilotSessionFiles, sources.ParseCopilotFile},
+		{"copilot-chat", sources.CopilotChatRoots(), sources.CopilotChatSessionFiles, sources.ParseCopilotChatFile},
 		// Both were listed by the text rows and by nothing else: absent here,
 		// `doctor --json` never named them and "no agent history was found on
 		// this machine" was printed on a machine whose history is theirs
 		// (#999).
-		{"cline", sources.ClineStoreRoots(), sources.ClineSessionFiles(), sources.ParseClineFile},
-		{"roo", sources.RooRoots(), sources.RooTaskFiles(), sources.ParseRooTask},
+		{"cline", sources.ClineStoreRoots(), sources.ClineSessionFiles, sources.ParseClineFile},
+		{"roo", sources.RooRoots(), sources.RooTaskFiles, sources.ParseRooTask},
 		// The extension's tasks and the CLI's database, both: built from the
 		// tasks alone, the row said "missing" with no paths on a machine whose
 		// every Kilo session is in the database (#4397).
-		{"kilocode", append(sources.KiloRoots(), sources.KiloDB()), sources.KiloSessionFiles(), doctorProbeKilo},
-		{"cherrystudio", sources.CherryStudioAllRoots(), sources.CherryStudioSessionFiles(), sources.ParseCherryStudioFile},
+		{"kilocode", append(sources.KiloRoots(), sources.KiloDB()), sources.KiloSessionFiles, doctorProbeKilo},
+		{"cherrystudio", sources.CherryStudioAllRoots(), sources.CherryStudioSessionFiles, sources.ParseCherryStudioFile},
 		// One row for both Kiro clients: the probe picks the reader from the
 		// path, the way the ingest does.
-		{"kiro", []string{sources.KiroRoot()}, sources.KiroSessionFiles(), doctorProbeKiro},
-		{"senpi", []string{sources.SenpiRoot()}, sources.SenpiSessionFiles(), sources.ParseSenpiFile},
-		{"kimchi", []string{sources.KimchiRoot()}, sources.KimchiSessionFiles(), sources.ParseKimchiFile},
-		{"commandcode", []string{sources.CommandCodeRoot()}, sources.CommandCodeSessionFiles(), sources.ParseCommandCodeFile},
+		{"kiro", []string{sources.KiroRoot()}, sources.KiroSessionFiles, doctorProbeKiro},
+		{"senpi", []string{sources.SenpiRoot()}, sources.SenpiSessionFiles, sources.ParseSenpiFile},
+		{"kimchi", []string{sources.KimchiRoot()}, sources.KimchiSessionFiles, sources.ParseKimchiFile},
+		{"commandcode", []string{sources.CommandCodeRoot()}, sources.CommandCodeSessionFiles, sources.ParseCommandCodeFile},
 		// The transcripts and the database, each probed with its own reader:
 		// the transcript reader answers zero for the database, which made the
 		// row read `parsed-zero` (#3675), and leaving the database out made it
 		// read `missing` for a CLI-only store (#4397).
-		{"zcode", []string{sources.ZCodeRoot(), sources.ZCodeDB(), sources.ZCodeLegacyRoot()}, sources.ZCodeSessionFiles(), doctorProbeZCode},
-		{"gjc", []string{sources.GjcRoot()}, sources.GjcSessionFiles(), sources.ParseGjcFile},
-		{"codewhale", sources.CodeWhaleRoots(), sources.CodeWhaleSessionFiles(), sources.ParseCodeWhaleFile},
-		{"junie", []string{sources.JunieRoot()}, sources.JunieSessionFiles(), sources.ParseJunieFile},
-		{"jetbrains", []string{sources.JetBrainsRoot()}, sources.JetBrainsSessionFiles(), sources.ParseJetBrainsFile},
-		{"windsurf", []string{sources.WindsurfRoot()}, sources.WindsurfSessionFiles(), sources.ParseWindsurfFile},
-		{"reasonix", sources.ReasonixRoots(), sources.ReasonixSessionFiles(), sources.ParseReasonixFile},
-		{"muse", sources.MuseRoots(), sources.MuseSessionFiles(), sources.ParseMuseFile},
-		{"deepseek", []string{sources.DeepSeekRoot()}, sources.DeepSeekSessionFiles(), sources.ParseDeepSeekFile},
+		{"zcode", []string{sources.ZCodeRoot(), sources.ZCodeDB(), sources.ZCodeLegacyRoot()}, sources.ZCodeSessionFiles, doctorProbeZCode},
+		{"gjc", []string{sources.GjcRoot()}, sources.GjcSessionFiles, sources.ParseGjcFile},
+		{"codewhale", sources.CodeWhaleRoots(), sources.CodeWhaleSessionFiles, sources.ParseCodeWhaleFile},
+		{"junie", []string{sources.JunieRoot()}, sources.JunieSessionFiles, sources.ParseJunieFile},
+		{"jetbrains", []string{sources.JetBrainsRoot()}, sources.JetBrainsSessionFiles, sources.ParseJetBrainsFile},
+		{"windsurf", []string{sources.WindsurfRoot()}, sources.WindsurfSessionFiles, sources.ParseWindsurfFile},
+		{"reasonix", sources.ReasonixRoots(), sources.ReasonixSessionFiles, sources.ParseReasonixFile},
+		{"muse", sources.MuseRoots(), sources.MuseSessionFiles, sources.ParseMuseFile},
+		{"deepseek", []string{sources.DeepSeekRoot()}, sources.DeepSeekSessionFiles, sources.ParseDeepSeekFile},
 		// Zed keeps one SQLite store rather than session files, so the file
 		// list is the database itself — the shape opencode's row uses.
-		{"zed", []string{sources.ZedDB()}, presentDoctorFile(sources.ZedDB()), doctorProbeZed},
+		{"zed", []string{sources.ZedDB()}, func() []string { return presentDoctorFile(sources.ZedDB()) }, doctorProbeZed},
 		// Devin keeps one SQLite store too, beside which a second file can be
 		// the store: the legacy name the pre-rename builds wrote.
-		{"devin", []string{sources.DevinSessionsDB(), sources.DevinLegacySessionsDB()}, sources.DevinFiles(), doctorProbeDevin},
-		{"deja", []string{sources.NotesFile()}, presentDoctorFile(sources.NotesFile()), sources.ParseNotesFile},
+		{"devin", []string{sources.DevinSessionsDB(), sources.DevinLegacySessionsDB()}, sources.DevinFiles, doctorProbeDevin},
+		{"deja", []string{sources.NotesFile()}, func() []string { return presentDoctorFile(sources.NotesFile()) }, sources.ParseNotesFile},
 	}
 	// A store DEJA_STORES silences has no row: it is not missing, not empty and
 	// not unreadable, and saying any of those about a store nobody asked deja to
@@ -588,7 +594,12 @@ func doctorStoreChecks() []doctorStoreCheck {
 		if sources.StoreSilenced(c.name) {
 			continue
 		}
-		out = append(out, c)
+		check := doctorStoreCheck{name: c.name, paths: c.paths, parse: c.parse}
+		// An excluded store keeps its row, which says `excluded`.
+		if !sources.HarnessExcluded(c.name) {
+			check.files = c.files()
+		}
+		out = append(out, check)
 	}
 	return out
 }
@@ -827,7 +838,17 @@ func probeDoctorStore(check doctorStoreCheck) (store doctorStore, mod time.Time,
 		}
 		return store, time.Time{}, ""
 	}
-	newest, mod = newestDoctorFile(check.files)
+	// A transcript whose mode refuses a read is the same fault in any file,
+	// not only the newest one this probe opens; the walk that indexes it says
+	// so from the same stat (#5393).
+	var unreadable string
+	newest, mod, unreadable = newestDoctorFile(check.files)
+	if unreadable != "" {
+		store.State = "denied"
+		store.Denied = unreadable
+		store.Partial = anotherFileOpens(check.files, unreadable)
+		return store, mod, ""
+	}
 	f, err := os.Open(newest)
 	if err != nil {
 		if os.IsPermission(err) {
@@ -896,17 +917,39 @@ func parseDoctorStore(check doctorStoreCheck, store doctorStore, mod time.Time, 
 	return store, mod
 }
 
-func newestDoctorFile(files []string) (string, time.Time) {
+// newestDoctorFile is the most recently modified of files with its time, and
+// the first of them in path order whose mode says this process may not read
+// it. One stat a file, on every core: a walk for each answer was a third of
+// what `deja index` spent after its pass on a 40,000-session store (#5471).
+func newestDoctorFile(files []string) (newest string, mod time.Time, unreadable string) {
 	files = append([]string(nil), files...)
 	sort.Strings(files)
-	newest := files[0]
-	var newestMod time.Time
-	for _, path := range files {
-		if fi, err := os.Stat(path); err == nil && fi.ModTime().After(newestMod) {
-			newest, newestMod = path, fi.ModTime()
+	refused := make([]bool, len(files))
+	mods := make([]time.Time, len(files))
+	parallelChunks(len(files), func(i int) {
+		fi, err := os.Lstat(files[i])
+		if err != nil {
+			return
+		}
+		refused[i] = sources.ModeUnreadable(files[i], fi)
+		// The time is the file's, not a link's.
+		if !fi.Mode().IsRegular() {
+			if fi, err = os.Stat(files[i]); err != nil {
+				return
+			}
+		}
+		mods[i] = fi.ModTime()
+	})
+	newest = files[0]
+	for i, path := range files {
+		if unreadable == "" && refused[i] {
+			unreadable = path
+		}
+		if mods[i].After(mod) {
+			newest, mod = path, mods[i]
 		}
 	}
-	return newest, newestMod
+	return newest, mod, unreadable
 }
 
 func inspectDoctorIndex(dir string, storeMods []time.Time) doctorIndexReport {

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // frictionTextsFile holds, for every session that carries a wall, the first
@@ -97,7 +98,7 @@ func stampText(h uint64, text string) uint64 {
 // walls not already there. It is frictionTexts' loop with the wanted set
 // fixed to every wall.
 func firstFrictionLines(text string, walls map[uint64]bool, lines map[uint64]string) {
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		line, ok := FrictionLine(line)
 		if !ok || line == "" {
 			continue
@@ -194,6 +195,10 @@ func writeFrictionTexts(dir string, m Manifest, size int64) error {
 			// A promoted note is reordered on load, so its first lines are
 			// not an append's to extend.
 			whole[k] = true
+		case meta.Shared:
+			// The tail may be a copy that took the row, which leaves the old
+			// entry the other copy's.
+			whole[k] = true
 		default:
 			extend[k] = true
 		}
@@ -283,6 +288,9 @@ func keepWalls(lines map[uint64]string, walls map[uint64]bool) map[uint64]string
 	return out
 }
 
+// frictionOutputsRead counts the tool outputs read back to write the file.
+var frictionOutputsRead int64
+
 // readFrictionEntries reads the tool output of keys from offset from on and
 // folds it onto what start gives each key. A promoted note is loaded the way
 // frictionReader loads it.
@@ -294,6 +302,7 @@ func readFrictionEntries(dir string, m Manifest, f *os.File, t *recordTables, ke
 	// In the read's own goroutine: the parse is a fraction of a second on a
 	// real store, and handing 150k outputs to workers cost more in wakeups.
 	send := func(key, text string) {
+		atomic.AddInt64(&frictionOutputsRead, 1)
 		e, ok := out[key]
 		if !ok {
 			e.stamp, e.lines = start(key)
@@ -316,11 +325,16 @@ func readFrictionEntries(dir string, m Manifest, f *os.File, t *recordTables, ke
 	var err error
 	if len(plain) > 0 {
 		roles := map[string]bool{roleToolOutput: true}
-		each := func(r Record) { send(r.Key, r.Text) }
+		each := func(r Record) {
+			// The row's copy, as the reader takes it (see toolOutput).
+			if !foreignPath(r.SourcePath, m.Sessions[r.Key]) {
+				send(r.Key, r.Text)
+			}
+		}
 		if from == 0 {
 			err = eachRecordForKeysInRoles(filepath.Join(dir, "records.bin"), t, plain, roles, each)
 		} else if _, err = f.Seek(from, io.SeekStart); err == nil {
-			err = walkRecordsForKeys(bufio.NewReaderSize(f, 256*1024), t, plain, roles, each)
+			err = walkRecordsForKeys(bufio.NewReaderSize(f, 256*1024), from, t, plain, roles, each)
 		}
 	}
 	for _, meta := range notes {
@@ -508,4 +522,68 @@ func loadFrictionTexts(dir string, m Manifest, want map[uint64]string) map[strin
 		return nil
 	}
 	return ft.entries
+}
+
+// carryFrictionTexts hands a pass that writes its log again in tmp the
+// entries of the log in dir, re-stamped for the new log, less the sessions in
+// changed. The rest were copied record for record in their order, so their
+// stamps and lines still hold, and the commit reads only the changed ones.
+// Without it every entry was checked against the new log by reading every
+// session that carries a wall (#5402). A file that does not describe dir's
+// committed log is copied as it is, and checked entry by entry as before.
+func carryFrictionTexts(dir, tmp string, old Manifest, changed map[string]bool) {
+	b, err := os.ReadFile(filepath.Join(dir, frictionTextsFile))
+	if err != nil {
+		return
+	}
+	dst := filepath.Join(tmp, frictionTextsFile)
+	ft, ok := decodeFrictionTexts(b)
+	// A prefix of the log, not the whole of it: a pass that appends its
+	// records shares dir's log, which has grown by them already (#5387).
+	if !ok || ft.size != old.RecordsSize || !logPrefixIs(filepath.Join(dir, "records.bin"), ft.size, ft.fp) {
+		// Not the committed log's. Copied, it would read as covering a log
+		// an appending pass leaves the same up to its tail, sessions it
+		// replaced included; the commit builds the file instead.
+		return
+	}
+	size, fp, err := logFingerprint(filepath.Join(tmp, "records.bin"))
+	if err != nil {
+		_ = os.WriteFile(dst, b, 0o600)
+		return
+	}
+	for k := range changed {
+		delete(ft.entries, k)
+	}
+	ft.size, ft.fp = size, fp
+	_ = writeFileAtomic(dst, encodeFrictionTexts(ft))
+}
+
+// logFingerprint is the size and fingerprint of the whole log at path.
+func logFingerprint(path string) (int64, [sha256.Size]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, [sha256.Size]byte{}, err
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, [sha256.Size]byte{}, err
+	}
+	fp, err := recordLogFingerprint(f, fi.Size())
+	return fi.Size(), fp, err
+}
+
+// logPrefixIs reports whether the log at path starts with size bytes whose
+// fingerprint is fp.
+func logPrefixIs(path string, size int64, fp [sha256.Size]byte) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	if fi, err := f.Stat(); err != nil || fi.Size() < size {
+		return false
+	}
+	got, err := recordLogFingerprint(f, size)
+	return err == nil && got == fp
 }

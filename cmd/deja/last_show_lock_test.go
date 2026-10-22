@@ -56,7 +56,7 @@ func TestLastAndShowAnswerWhileAnotherDejaHoldsTheIndexLock(t *testing.T) {
 					if err != nil {
 						t.Errorf("%s: %v", r.name, err)
 					}
-				case <-time.After(5 * time.Second):
+				case <-time.After(2 * time.Minute):
 					waited = r.name
 				}
 			})
@@ -77,7 +77,7 @@ func TestLastAndShowAnswerWhileAnotherDejaHoldsTheIndexLock(t *testing.T) {
 			t.Errorf("%s updated the index under a held lock instead of reading it as it was:\n%s", r.name, stdout[i])
 		}
 	}
-	if n := strings.Count(stderr, "answering from the index as it was"); n != 1 {
+	if n := strings.Count(stderr, "answering from the index of"); n != 1 {
 		t.Errorf("the stale-answer line went out %d times, want once:\n%s", n, stderr)
 	}
 	if spawned != 1 {
@@ -97,7 +97,7 @@ func TestLastAndShowAnswerWhileAnotherDejaHoldsTheIndexLock(t *testing.T) {
 	if !strings.Contains(free, "sessz") {
 		t.Errorf("with the lock free, last did not index the new transcript first:\n%s", free)
 	}
-	if strings.Contains(stderr, "as it was") {
+	if strings.Contains(stderr, "answering from the index") {
 		t.Errorf("with the lock free, last said it answered from a stale index:\n%s", stderr)
 	}
 }

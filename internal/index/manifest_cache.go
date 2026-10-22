@@ -23,17 +23,23 @@ import (
 // drops the entry itself (writeManifest), and the stamp is what catches a
 // rewrite by another process.
 //
+// sessions.gob is half of the manifest and is keyed the same way: the
+// freshness check reads through this cache too, and a sessions file damaged
+// under an unchanged manifest.gob has to reach it as the error that rebuilds
+// the index, not be answered from memory (#5386).
+//
 // Contract: the cached Manifest is shared — read-only paths must not mutate
-// it. Ingestion keeps using readManifest directly.
+// it. Writers keep using readManifest directly.
 var manifestCache struct {
 	mu sync.Mutex
 	// dir and fi are what the entry was read from: fi carries the file's
 	// identity as well as its time and size, so a manifest swapped in by a
 	// rebuild never reuses the entry of the one it replaced.
-	dir string
-	fi  os.FileInfo
-	m   Manifest
-	ok  bool
+	dir      string
+	fi       os.FileInfo
+	sessions os.FileInfo
+	m        Manifest
+	ok       bool
 }
 
 func readManifestCached(dir string) (Manifest, error) {
@@ -43,8 +49,12 @@ func readManifestCached(dir string) (Manifest, error) {
 	if err != nil {
 		return readManifest(dir)
 	}
+	si, err := os.Stat(filepath.Join(dir, "sessions.gob"))
+	if err != nil {
+		return readManifest(dir)
+	}
 	manifestCache.mu.Lock()
-	if manifestCache.ok && manifestCache.dir == dir && sameGeneration(manifestCache.fi, fi) {
+	if manifestCache.ok && manifestCache.dir == dir && sameGeneration(manifestCache.fi, fi) && sameGeneration(manifestCache.sessions, si) {
 		m := manifestCache.m
 		manifestCache.mu.Unlock()
 		return m, nil
@@ -54,11 +64,30 @@ func readManifestCached(dir string) (Manifest, error) {
 	if err != nil {
 		return m, err
 	}
+	cacheManifest(dir, fi, si, m)
+	return m, nil
+}
+
+// cacheManifest makes m the cached manifest of dir, as read from the files fi
+// and si describe.
+func cacheManifest(dir string, fi, si os.FileInfo, m Manifest) {
 	manifestCache.mu.Lock()
-	manifestCache.dir, manifestCache.fi = dir, fi
+	manifestCache.dir, manifestCache.fi, manifestCache.sessions = dir, fi, si
 	manifestCache.m, manifestCache.ok = m, true
 	manifestCache.mu.Unlock()
-	return m, nil
+}
+
+// moveManifestCache follows a directory renamed from tmp to dir: its files
+// are the same files, so a manifest cached for tmp is dir's now.
+func moveManifestCache(tmp, dir string) {
+	manifestCache.mu.Lock()
+	defer manifestCache.mu.Unlock()
+	switch manifestCache.dir {
+	case tmp:
+		manifestCache.dir = dir
+	case dir:
+		manifestCache.ok = false
+	}
 }
 
 // manifestGeneration is the manifest file as one stat sees it, nil when there
@@ -66,6 +95,15 @@ func readManifestCached(dir string) (Manifest, error) {
 // these name the same generation only if they are the same file.
 func manifestGeneration(dir string) os.FileInfo {
 	fi, err := os.Stat(filepath.Join(dir, "manifest.gob"))
+	if err != nil {
+		return nil
+	}
+	return fi
+}
+
+// sessionsGeneration is manifestGeneration for sessions.gob.
+func sessionsGeneration(dir string) os.FileInfo {
+	fi, err := os.Stat(filepath.Join(dir, "sessions.gob"))
 	if err != nil {
 		return nil
 	}
@@ -151,6 +189,60 @@ type tokenIndex struct {
 	umlauted    []string
 	byDigraph   map[string][]string
 	digraphOnce sync.Once
+	// dirs is every bucket's directory, read with the catalog, for the
+	// part-of-word step to walk without opening every bucket again.
+	dirs []bucketDir
+	// glued keys the non-ASCII tokens by their first and last runes, for the
+	// step that finds a Russian word glued to something else (#5386).
+	glued     gluedIndex
+	gluedOnce sync.Once
+}
+
+// gluedKeyRunes is how many runes of a token's head and tail key it. The
+// shortest form the glued step asks about is four runes long, so a token that
+// starts or ends with one shares these with it.
+const gluedKeyRunes = 4
+
+type gluedIndex struct {
+	head, tail map[string][]string
+}
+
+// gluedKeys is the non-ASCII tokens longer than gluedKeyRunes, keyed by their
+// first and by their last gluedKeyRunes runes. Built once per catalog, on the
+// first query that reaches the glued step.
+func (t *tokenIndex) gluedKeys() gluedIndex {
+	t.gluedOnce.Do(func() {
+		t.glued = gluedIndex{head: map[string][]string{}, tail: map[string][]string{}}
+		for tok := range t.set {
+			if isASCIIString(tok) || utf8.RuneCountInString(tok) <= gluedKeyRunes {
+				continue
+			}
+			h, tl := runeHead(tok, gluedKeyRunes), runeTail(tok, gluedKeyRunes)
+			t.glued.head[h] = append(t.glued.head[h], tok)
+			t.glued.tail[tl] = append(t.glued.tail[tl], tok)
+		}
+	})
+	return t.glued
+}
+
+// runeHead is the first n runes of s, or all of it when it is shorter.
+func runeHead(s string, n int) string {
+	i := 0
+	for ; n > 0 && i < len(s); n-- {
+		_, w := utf8.DecodeRuneInString(s[i:])
+		i += w
+	}
+	return s[:i]
+}
+
+// runeTail is the last n runes of s, or all of it when it is shorter.
+func runeTail(s string, n int) string {
+	i := len(s)
+	for ; n > 0 && i > 0; n-- {
+		_, w := utf8.DecodeLastRuneInString(s[:i])
+		i -= w
+	}
+	return s[i:]
 }
 
 const maxIndexedTokenLen = 64
@@ -319,11 +411,13 @@ func tokenIndexCached(dir string) (*tokenIndex, error) {
 	catalogReads.Add(1)
 	sig, err := bucketsSignature(dir)
 	if err != nil {
-		c, cerr := tokenCatalog(dir)
+		c, dirs, cerr := tokenCatalogDirs(dir)
 		if cerr != nil {
 			return nil, cerr
 		}
-		return newTokenIndex(c), nil
+		i := newTokenIndex(c)
+		i.dirs = dirs
+		return i, nil
 	}
 	catalogCache.mu.Lock()
 	if catalogCache.ok && catalogCache.dir == dir && catalogCache.sig == sig {
@@ -332,11 +426,12 @@ func tokenIndexCached(dir string) (*tokenIndex, error) {
 		return i, nil
 	}
 	catalogCache.mu.Unlock()
-	c, err := tokenCatalog(dir)
+	c, dirs, err := tokenCatalogDirs(dir)
 	if err != nil {
 		return nil, err
 	}
 	i := newTokenIndex(c)
+	i.dirs = dirs
 	catalogCache.mu.Lock()
 	catalogCache.dir, catalogCache.sig = dir, sig
 	catalogCache.idx, catalogCache.ok = i, true

@@ -1,10 +1,9 @@
 package sources
 
 import (
-	"bytes"
-	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/model"
@@ -20,6 +19,8 @@ type Harness struct {
 	Load  func() []model.Session // full cold load of every session
 	Files func() []string        // current on-disk files to consider for indexing
 	Kinds []FileKind             // one or more on-disk file shapes to match+parse
+	// switched marks a Load the read switches wrap.
+	switched bool
 }
 
 // FileKind is one on-disk file shape belonging to a harness. A harness can have
@@ -45,6 +46,8 @@ type FileKind struct {
 	// is part of the file state and a change re-reads the session (#4319,
 	// #4446). nil when the transcript holds it all.
 	Sidecar func(path string) (size, stamp int64)
+	// switched marks a Parse and ParseFrom the read switches wrap.
+	switched bool
 }
 
 func sinceTime(nano int64) time.Time { return time.Unix(0, nano) }
@@ -61,22 +64,25 @@ func offsetParse(f func(string, int64) ([]model.Session, error)) func(string, in
 
 // dbParse/dbParseFrom handle the db-backed kinds — opencode, cursor, goose,
 // grok, hermes and zed — which filter by time rather than byte offset.
+// dbParse reads a database store whole or from its watermark. A read that
+// fails records the store as unread, as the full build's loaders do: a pass
+// that skipped a store whose query failed exited 0 (#5517).
 func dbParse(full func(string) ([]model.Session, error), since func(string, time.Time) ([]model.Session, error)) func(string, int64) ([]model.Session, error) {
 	return func(p string, nano int64) ([]model.Session, error) {
+		var ss []model.Session
+		var err error
 		if nano > 0 {
-			return since(p, sinceTime(nano))
+			ss, err = since(p, sinceTime(nano))
+		} else {
+			ss, err = full(p)
 		}
-		return full(p)
+		return dbRead(p, ss, err), err
 	}
 }
 
 func dbParseFrom(full func(string) ([]model.Session, error), since func(string, time.Time) ([]model.Session, error)) func(string, int64, int64) ([]model.Session, error) {
-	return func(p string, _ int64, nano int64) ([]model.Session, error) {
-		if nano > 0 {
-			return since(p, sinceTime(nano))
-		}
-		return full(p)
-	}
+	parse := dbParse(full, since)
+	return func(p string, _ int64, nano int64) ([]model.Session, error) { return parse(p, nano) }
 }
 
 // resumesUnlessAnswering is the Resumes of a format that files a tool call and
@@ -94,14 +100,8 @@ func resumesUnlessAnswering(hint string, answers func(m map[string]any) (calls [
 		}
 		made := map[string]bool{}
 		ok := true
-		_ = scanJSONLBytes(path, offset, func(line []byte) {
-			if !ok || !bytes.Contains(line, []byte(hint)) {
-				return
-			}
-			var m map[string]any
-			d := json.NewDecoder(bytes.NewReader(line))
-			d.UseNumber()
-			if d.Decode(&m) != nil {
+		_ = scanJSONLHinted(path, offset, []byte(hint), func(m map[string]any) {
+			if !ok {
 				return
 			}
 			calls, answered := answers(m)
@@ -145,6 +145,43 @@ func Registry() []Harness {
 	return out
 }
 
+// StoresToRead is Registry less the stores the reader excluded with a
+// `harness:` line or DEJA_EXCLUDE_HARNESSES. Every pass that walks or opens a
+// store starts here, so the exclusion holds on the incremental pass and the
+// freshness check as it does on a rebuild (#5394).
+func StoresToRead() []Harness {
+	reg := Registry()
+	skip := ExcludedHarnesses()
+	if len(skip) == 0 {
+		return reg
+	}
+	out := make([]Harness, 0, len(reg))
+	for _, h := range reg {
+		if !skip[h.Name] {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// StoreRead reports whether a store is one StoresToRead keeps, for callers
+// with their own list of stores.
+func StoreRead(name string) bool { return !StoreSilenced(name) && !HarnessExcluded(name) }
+
+// OutsideStoresRead reports a transcript path that belongs to a store this run
+// does not read. The index keeps such a row as it was, and a freshness check
+// that counted it as a change re-ran the pass on every search.
+func OutsideStoresRead(p string) bool {
+	for _, h := range allHarnesses() {
+		for _, k := range h.Kinds {
+			if k.Match != nil && k.Match(p) {
+				return !StoreRead(h.Name)
+			}
+		}
+	}
+	return false
+}
+
 // AllHarnesses is every harness deja knows how to read, whatever DEJA_STORES
 // says. The set `--harness` accepts, and the number the documentation counts:
 // silencing a store for one run does not make deja a tool that reads fewer
@@ -171,7 +208,7 @@ func harnessTable() []Harness {
 					Match:     func(p string) bool { return strings.HasSuffix(p, ".jsonl") && UnderClaudeRoot(p) },
 					Parse:     fullParse(ParseClaudeFile),
 					ParseFrom: offsetParse(ParseClaudeFileFromOffset),
-					Resumes:   claudeExitResumes,
+					Resumes:   claudeResumes,
 				},
 			},
 		},
@@ -353,8 +390,8 @@ func harnessTable() []Harness {
 				// db-backed kinds.
 				Name:      "hermes-pg",
 				Match:     func(p string) bool { return IsHermesPGStore(p) },
-				Parse:     func(_ string, nano int64) ([]model.Session, error) { return ParseHermesPG(HermesPGDSN(), nano) },
-				ParseFrom: func(_ string, _, nano int64) ([]model.Session, error) { return ParseHermesPG(HermesPGDSN(), nano) },
+				Parse:     func(p string, nano int64) ([]model.Session, error) { return hermesPGRead(p, nano) },
+				ParseFrom: func(p string, _, nano int64) ([]model.Session, error) { return hermesPGRead(p, nano) },
 			}},
 		},
 		{
@@ -856,19 +893,26 @@ func IsKnownHarness(name string) bool {
 // and "cline-vscode" are both cline. A caller holding a kind and speaking to a
 // person wants this one — the index run narrates per store, and looking a kind
 // up under the harness's own name found nothing (#2229).
-func HarnessForKind(kind string) string {
+//
+// The names are fixed, so the answer is a table built once: building the
+// registry per call to read it was 1.7 GB of a 12k-session cold build, where
+// every session's narration asks (#5586).
+func HarnessForKind(kind string) string { return kindStores()[kind] }
+
+var kindStores = sync.OnceValue(func() map[string]string {
+	out := map[string]string{}
 	for _, h := range allHarnesses() {
-		if h.Name == kind {
-			return h.Name
+		if _, ok := out[h.Name]; !ok {
+			out[h.Name] = h.Name
 		}
 		for _, k := range h.Kinds {
-			if k.Name == kind {
-				return h.Name
+			if _, ok := out[k.Name]; !ok {
+				out[k.Name] = h.Name
 			}
 		}
 	}
-	return ""
-}
+	return out
+})
 
 // KindForPath returns the fine-grained kind whose Match accepts p, or "".
 func KindForPath(p string) string {

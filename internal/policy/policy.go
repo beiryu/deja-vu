@@ -39,6 +39,23 @@ type Policy struct {
 	// what exists and says nothing about what the same directory writes
 	// tomorrow (#2050). Empty means the default in ignore.go.
 	Ignore []string `json:"ignore,omitempty"`
+	// AutoIndex false stops every automatic index update: searches, recall
+	// and hooks answer from the last finished index, and only `deja index`
+	// writes it. For a busy machine that refreshes from cron (#5385).
+	AutoIndex *bool `json:"auto_index,omitempty"`
+	// SearchOnly true builds the index for conversation search alone and
+	// skips mining fixes, co-occurrence, commands, command failures and
+	// session facts (#5395).
+	SearchOnly bool `json:"search_only,omitempty"`
+}
+
+// SearchOnlyOn reports "search_only": true in the policy file.
+func SearchOnlyOn() bool { return Load().SearchOnly }
+
+// AutoIndexOff reports "auto_index": false in the policy file.
+func AutoIndexOff() bool {
+	p := Load()
+	return p.AutoIndex != nil && !*p.AutoIndex
 }
 
 func Path() string {
@@ -234,7 +251,7 @@ func Diagnose() (exists bool, unknown []string, err error) {
 	if json.Unmarshal(b, &top) == nil {
 		for key := range top {
 			switch key {
-			case "activations", "ignore":
+			case "activations", "ignore", "auto_index", "search_only":
 			default:
 				unknown = append(unknown, key)
 			}

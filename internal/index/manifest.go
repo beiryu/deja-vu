@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -305,7 +306,7 @@ func HarnessUnreadCounts(dir string) map[string]int {
 		return nil
 	}
 	out := map[string]int{}
-	for _, h := range sources.Registry() {
+	for _, h := range sources.StoresToRead() {
 		for _, p := range h.Files() {
 			if _, ok := m.Files[p]; ok {
 				continue
@@ -427,6 +428,16 @@ func manifestFresh(m Manifest, files map[string]FileState, scope string) bool {
 			if _, ok := files[p]; ok || p == syncImportPath {
 				continue
 			}
+			// A store this run does not read keeps its rows as they were
+			// (#5394): nothing for a pass to do.
+			if sources.OutsideStoresRead(p) {
+				continue
+			}
+			// Behind a directory this run may not enter: held as it was, and
+			// named as unreadable (#5393).
+			if !f.Kept && behindLockedDir(p) {
+				continue
+			}
 			// Still gone, from a store that is still there: nothing for a
 			// pass to do. A store that went whole is a change.
 			if !f.Kept || !deletedFromLiveStore(p) {
@@ -439,10 +450,13 @@ func manifestFresh(m Manifest, files map[string]FileState, scope string) bool {
 	}
 	// A store skipped for a missing CLI leaves the transcripts untouched, so
 	// nothing here would notice that the tool has since been installed (#1760).
-	if toolsChanged(m) {
+	if toolsChanged(m) || miningChanged(m) {
 		return false
 	}
 	if m.Scope != scope {
+		return false
+	}
+	if !unreadableCurrent(m, files) {
 		return false
 	}
 	// A rollout waiting for zstd changes nothing until it changes or zstd
@@ -461,16 +475,26 @@ func manifestFresh(m Manifest, files map[string]FileState, scope string) bool {
 	return true
 }
 
+// manifestDecodes counts readManifest's decodes, for the test that pins how
+// many a search makes (#5386).
+var manifestDecodes atomic.Int64
+
 func readManifest(dir string) (Manifest, error) {
+	manifestDecodes.Add(1)
 	var core manifestCore
 	if err := readGob(filepath.Join(dir, "manifest.gob"), &core); err != nil {
 		return Manifest{}, err
 	}
-	m := Manifest{Version: core.Version, Format: core.Format, Files: core.Files, BuiltAt: core.BuiltAt, SourcesReadAt: core.SourcesReadAt, Generation: core.Generation, Scope: core.Scope, Redacted: core.Redacted, RedactionRules: core.RedactionRules, ExportWatermarks: core.ExportWatermarks, ExportBoundary: core.ExportBoundary, ImportedRecords: core.ImportedRecords, RecordStrings: core.RecordStrings, RecordsSize: core.RecordsSize, BucketFiles: core.BucketFiles, IngestHealth: core.IngestHealth, IngestFiles: core.IngestFiles, ExcludeFingerprint: core.ExcludeFingerprint, ToolFingerprint: core.ToolFingerprint, Compactions: core.Compactions, KeptDated: core.KeptDated, ReadZone: core.ReadZone, Deferred: core.Deferred, Sessions: map[string]SessionMeta{}}
+	m := manifestFromCore(core, map[string]SessionMeta{})
 	if err := readGob(filepath.Join(dir, "sessions.gob"), &m.Sessions); err != nil {
 		return Manifest{}, err
 	}
 	return m, nil
+}
+
+// manifestFromCore is the Manifest that manifest.gob's core and sessions make.
+func manifestFromCore(core manifestCore, sessions map[string]SessionMeta) Manifest {
+	return Manifest{Version: core.Version, Format: core.Format, Files: core.Files, BuiltAt: core.BuiltAt, SourcesReadAt: core.SourcesReadAt, Generation: core.Generation, Scope: core.Scope, Redacted: core.Redacted, RedactionRules: core.RedactionRules, ExportWatermarks: core.ExportWatermarks, ExportBoundary: core.ExportBoundary, ImportedRecords: core.ImportedRecords, RecordStrings: core.RecordStrings, RecordsSize: core.RecordsSize, DeadRecords: core.DeadRecords, DeadBytes: core.DeadBytes, BucketFiles: core.BucketFiles, IngestHealth: core.IngestHealth, IngestFiles: core.IngestFiles, ExcludeFingerprint: core.ExcludeFingerprint, ToolFingerprint: core.ToolFingerprint, Compactions: core.Compactions, KeptDated: core.KeptDated, ReadZone: core.ReadZone, Deferred: core.Deferred, PartialOf: core.PartialOf, SearchOnly: core.SearchOnly, Empty: core.Empty, Sessions: sessions}
 }
 
 // writeManifestOnly persists manifest.gob without rewriting sessions.gob —
@@ -478,7 +502,7 @@ func readManifest(dir string) (Manifest, error) {
 // caller has not loaded sessions and must not clobber them. It wrote no
 // records, so it keeps the sizes the manifest committed: see stampStore.
 func writeManifestOnly(dir string, m Manifest) error {
-	core := manifestCore{Version: m.Version, Format: m.Format, Files: m.Files, BuiltAt: m.BuiltAt, SourcesReadAt: m.SourcesReadAt, Generation: m.Generation, Scope: m.Scope, Redacted: m.Redacted, RedactionRules: m.RedactionRules, ExportWatermarks: m.ExportWatermarks, ExportBoundary: m.ExportBoundary, ImportedRecords: m.ImportedRecords, RecordStrings: m.RecordStrings, IngestHealth: m.IngestHealth, IngestFiles: m.IngestFiles, ExcludeFingerprint: m.ExcludeFingerprint, ToolFingerprint: m.ToolFingerprint, Compactions: m.Compactions, KeptDated: m.KeptDated, ReadZone: m.ReadZone, Deferred: m.Deferred}
+	core := manifestCore{Version: m.Version, Format: m.Format, Files: m.Files, BuiltAt: m.BuiltAt, SourcesReadAt: m.SourcesReadAt, Generation: m.Generation, Scope: m.Scope, Redacted: m.Redacted, RedactionRules: m.RedactionRules, ExportWatermarks: m.ExportWatermarks, ExportBoundary: m.ExportBoundary, ImportedRecords: m.ImportedRecords, RecordStrings: m.RecordStrings, DeadRecords: m.DeadRecords, DeadBytes: m.DeadBytes, IngestHealth: m.IngestHealth, IngestFiles: m.IngestFiles, ExcludeFingerprint: m.ExcludeFingerprint, ToolFingerprint: m.ToolFingerprint, Compactions: m.Compactions, KeptDated: m.KeptDated, ReadZone: m.ReadZone, Deferred: m.Deferred, PartialOf: m.PartialOf, SearchOnly: m.SearchOnly, Empty: m.Empty}
 	stampStore(dir, &core, m, false)
 	err := writeGobAtomic(filepath.Join(dir, "manifest.gob"), core)
 	invalidateManifestCache(dir)
@@ -500,7 +524,7 @@ func stampStore(dir string, core *manifestCore, m Manifest, wroteRecords bool) {
 	if fi, err := os.Stat(filepath.Join(dir, "records.bin")); err == nil {
 		core.RecordsSize = fi.Size()
 	}
-	core.BucketFiles = countBucketFiles(filepath.Join(dir, "buckets"))
+	core.BucketFiles = max(countBucketFiles(filepath.Join(dir, "buckets"))-m.bucketsLeaving, 0)
 }
 
 // writeManifest commits the two-file manifest crash-safely. sessions.gob is
@@ -510,23 +534,32 @@ func stampStore(dir string, core *manifestCore, m Manifest, wroteRecords bool) {
 // leaves the old manifest pointing at old data, and the next run reindexes
 // rather than serving a fresh-looking index whose sessions are stale.
 func writeManifest(dir string, m Manifest) error {
-	return commitManifest(dir, m, true)
+	return commitManifest(dir, m, true, false)
+}
+
+// writeManifestShared is writeManifest for a pass that is done with m: what
+// it wrote becomes this process's cached manifest, so the reads that follow
+// the pass do not decode the files it has just encoded (#5471). The caller
+// must not change m, its maps or its slices afterwards.
+func writeManifestShared(dir string, m Manifest) error {
+	return commitManifest(dir, m, true, true)
 }
 
 // writeManifestMeta is writeManifest for a writer that changed sessions or
 // files but appended no records, such as a followed rename.
 func writeManifestMeta(dir string, m Manifest) error {
-	return commitManifest(dir, m, false)
+	return commitManifest(dir, m, false, false)
 }
 
-func commitManifest(dir string, m Manifest, wroteRecords bool) error {
+func commitManifest(dir string, m Manifest, wroteRecords, share bool) error {
 	mergeIngestDiag(&m)
-	core := manifestCore{Version: m.Version, Format: m.Format, Files: m.Files, BuiltAt: m.BuiltAt, SourcesReadAt: m.SourcesReadAt, Generation: m.Generation, Scope: m.Scope, Redacted: m.Redacted, RedactionRules: m.RedactionRules, ExportWatermarks: m.ExportWatermarks, ExportBoundary: m.ExportBoundary, ImportedRecords: m.ImportedRecords, RecordStrings: m.RecordStrings, IngestHealth: m.IngestHealth, IngestFiles: m.IngestFiles, ExcludeFingerprint: m.ExcludeFingerprint, ToolFingerprint: m.ToolFingerprint, Compactions: m.Compactions, KeptDated: m.KeptDated, ReadZone: m.ReadZone, Deferred: m.Deferred}
+	core := manifestCore{Version: m.Version, Format: m.Format, Files: m.Files, BuiltAt: m.BuiltAt, SourcesReadAt: m.SourcesReadAt, Generation: m.Generation, Scope: m.Scope, Redacted: m.Redacted, RedactionRules: m.RedactionRules, ExportWatermarks: m.ExportWatermarks, ExportBoundary: m.ExportBoundary, ImportedRecords: m.ImportedRecords, RecordStrings: m.RecordStrings, DeadRecords: m.DeadRecords, DeadBytes: m.DeadBytes, IngestHealth: m.IngestHealth, IngestFiles: m.IngestFiles, ExcludeFingerprint: m.ExcludeFingerprint, ToolFingerprint: m.ToolFingerprint, Compactions: m.Compactions, KeptDated: m.KeptDated, ReadZone: m.ReadZone, Deferred: m.Deferred, PartialOf: m.PartialOf, SearchOnly: m.SearchOnly, Empty: m.Empty}
 	stampStore(dir, &core, m, wroteRecords)
-	if err := writeGobAtomic(filepath.Join(dir, "sessions.gob"), m.Sessions); err != nil {
+	sfi, err := writeGobAtomicStat(filepath.Join(dir, "sessions.gob"), m.Sessions)
+	if err != nil {
 		return err
 	}
-	err := writeGobAtomic(filepath.Join(dir, "manifest.gob"), core)
+	mfi, err := writeGobAtomicStat(filepath.Join(dir, "manifest.gob"), core)
 	// The cache this process holds is keyed on manifest.gob's mtime and size,
 	// and the comment there claimed the atomic swap always changes that pair.
 	// It does not: a rewrite that keeps the size and lands inside one tick of
@@ -534,6 +567,13 @@ func commitManifest(dir string, m Manifest, wroteRecords bool) error {
 	// then answers from the manifest before this one. The writer knows, so it
 	// says so.
 	invalidateManifestCache(dir)
+	if err == nil && share && mfi != nil && sfi != nil {
+		sessions := m.Sessions
+		if sessions == nil {
+			sessions = map[string]SessionMeta{}
+		}
+		cacheManifest(dir, mfi, sfi, manifestFromCore(core, sessions))
+	}
 	if err == nil && wroteRecords {
 		// Best effort: a table that could not be written leaves readers
 		// walking the log, which is what they did before it existed.
@@ -724,7 +764,9 @@ func recordsDamage(dir string, m Manifest, tolerateLonger bool) string {
 	return ""
 }
 
-// countBucketFiles counts the postings files a buckets directory holds.
+// countBucketFiles counts the postings files a buckets directory holds:
+// buckets and their overlays, for a lost overlay drops the postings it held
+// as surely as a lost bucket (#5426).
 func countBucketFiles(dir string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -732,7 +774,7 @@ func countBucketFiles(dir string) int {
 	}
 	n := 0
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".bin") {
+		if !e.IsDir() && isPostingsFile(e.Name()) {
 			n++
 		}
 	}
